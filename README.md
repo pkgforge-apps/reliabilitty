@@ -75,6 +75,19 @@ embedded and no FreeType/fontconfig runtime library is linked.
 Build needs only a Rust toolchain. The crate talks to X11 over the socket and
 does not link libX11.
 
+## Install
+
+Or just install the released binary:
+
+```sh
+wget "https://github.com/pkgforge-apps/reliabilitty/releases/latest/download/reliabilitty-$(uname -m)-linux.tar.xz" && \
+tar -xJf "reliabilitty-$(uname -m)-linux.tar.xz" && \
+mkdir -p "${XDG_BIN_HOME:-$HOME/.local/bin}" "${XDG_DATA_HOME:-$HOME/.local/share}/applications" && \
+cp "./reliabilitty-$(uname -m)-linux/rtty" "${XDG_BIN_HOME:-$HOME/.local/bin}/" && \
+cp "./reliabilitty-$(uname -m)-linux/share/applications/reliabilitty.desktop" "${XDG_DATA_HOME:-$HOME/.local/share}/applications/" && \
+cp -r "./reliabilitty-$(uname -m)-linux/share/icons" "${XDG_DATA_HOME:-$HOME/.local/share}/"
+```
+
 ## Usage
 
 ```sh
