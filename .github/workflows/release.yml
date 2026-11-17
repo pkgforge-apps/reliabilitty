@@ -1,0 +1,49 @@
+name: release
+
+# Builds the only release asset: a static x86_64 Linux binary.
+# release-plz creates the draft release and tag before this runs.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the release, such as v0.1.0
+        required: true
+        type: string
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build static binary
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          strip target/x86_64-unknown-linux-musl/release/rtty
+          cp target/x86_64-unknown-linux-musl/release/rtty rtty-x86_64-linux-static
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: rtty-x86_64-linux-static
+      - name: Upload asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: gh release upload "$TAG" rtty-x86_64-linux-static --clobber
