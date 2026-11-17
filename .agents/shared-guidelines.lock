@@ -1,0 +1,7 @@
+# Written by scripts/sync-guidelines.sh. Do not edit.
+source pkgforge-apps/.github@fd35ab380b69efcfb26b8c37e6196dbe5d5d9d38
+file .editorconfig
+file .gitattributes
+file .release-plz.toml
+file scripts/check-ascii.sh
+file scripts/check.sh

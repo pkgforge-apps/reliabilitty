@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Reliabilitty
+Comment=A small, fast, reliable X11 terminal emulator
+Exec=rtty
+Icon=reliabilitty
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=Reliabilitty

@@ -1,0 +1,54 @@
+name: ci
+
+# Linux-only CI. The shared workflow tests three platforms and builds
+# bundles that this app does not ship, so this workflow is app-specific.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sh scripts/check.sh
+
+  smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Build static binary
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          strip target/x86_64-unknown-linux-musl/release/rtty
+      - name: Install Xvfb
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb fonts-dejavu-core
+      - name: Smoke test
+        run: xvfb-run -a timeout 60 target/x86_64-unknown-linux-musl/release/rtty --smoke
