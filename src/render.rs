@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::config::{FontConfig, FontDescription};
 use crate::scrollbar;
-use crate::theme::Rgb;
+use crate::theme::{Rgb, Theme};
 use crate::vt::{Attrs, Cell, Color, Terminal};
 
 /// A 32-bit pixel buffer. Opaque canvases use `0x00RRGGBB`; ARGB canvases
@@ -570,11 +570,7 @@ impl Renderer {
             bg = theme.selection_background;
         }
         if let Some(current) = highlight {
-            bg = if current {
-                theme.palette[11]
-            } else {
-                theme.palette[3]
-            };
+            bg = search_background(theme, current);
             fg = readable_on(bg);
         }
         let attrs = cell.attrs;
@@ -1012,6 +1008,14 @@ fn missing_glyph(canvas: &mut Canvas, x: i32, y: i32, width: i32, height: i32, c
     canvas.fill_rect(right - 1, top, 1, bottom - top, color);
 }
 
+fn search_background(theme: &Theme, current: bool) -> Rgb {
+    if current {
+        theme.palette[12]
+    } else {
+        theme.palette[3]
+    }
+}
+
 fn readable_on(color: Rgb) -> Rgb {
     let luminance = (299 * color[0] as u32 + 587 * color[1] as u32 + 114 * color[2] as u32) / 1000;
     if luminance > 140 {
@@ -1089,6 +1093,19 @@ mod tests {
     fn search_highlights_use_a_readable_foreground() {
         assert_eq!(readable_on([240, 198, 116]), [0, 0, 0]);
         assert_eq!(readable_on([16, 16, 16]), [255, 255, 255]);
+    }
+
+    #[test]
+    fn current_search_match_is_distinct_from_the_others() {
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let current = search_background(&theme, true);
+        let other = search_background(&theme, false);
+        let distance: u32 = current
+            .iter()
+            .zip(other)
+            .map(|(left, right)| left.abs_diff(right) as u32)
+            .sum();
+        assert!(distance > 200, "{current:?} is too close to {other:?}");
     }
 
     #[test]
