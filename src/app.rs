@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use x11rb::connection::Connection as _;
 use xkeysym::{Keysym, key};
 
@@ -400,8 +401,12 @@ impl App {
             }
             UiEvent::Close => self.quit = true,
             UiEvent::Paste(text) => {
-                self.terminal.scroll_to_bottom();
-                self.terminal.paste(&text);
+                if self.search.is_some() {
+                    self.search_push_str(&text);
+                } else {
+                    self.terminal.scroll_to_bottom();
+                    self.terminal.paste(&text);
+                }
             }
             UiEvent::Error(error) => eprintln!("rtty: {error}"),
         }
@@ -413,6 +418,9 @@ impl App {
             return;
         }
         if self.context_menu.is_some() {
+            if is_modifier_key(keysym) {
+                return;
+            }
             if keysym == key::Escape {
                 self.close_context_menu();
                 return;
@@ -486,6 +494,21 @@ impl App {
     fn search_push(&mut self, ch: char) {
         if let Some(search) = &mut self.search {
             search.query.push(ch);
+        }
+        self.apply_search_query();
+    }
+
+    fn search_push_str(&mut self, text: &str) {
+        if let Some(search) = &mut self.search {
+            for ch in text.chars() {
+                let ch = match ch {
+                    '\r' | '\n' | '\t' => ' ',
+                    other => other,
+                };
+                if !ch.is_control() {
+                    search.query.push(ch);
+                }
+            }
         }
         self.apply_search_query();
     }
@@ -669,16 +692,22 @@ impl App {
         let Some(menu) = self.context_menu else {
             return false;
         };
-        if pressed {
-            let item = if button == 1 {
-                self.menu_item_at(&menu, x, y)
-            } else {
-                None
-            };
-            self.close_context_menu();
-            if let Some(item) = item {
-                self.perform_menu_item(item, time);
+        if !pressed {
+            return true;
+        }
+        match button {
+            1 => {
+                let item = self.menu_item_at(&menu, x, y);
+                self.close_context_menu();
+                if let Some(item) = item {
+                    self.perform_menu_item(item, time);
+                }
             }
+            2 | 4 | 5 => {
+                self.close_context_menu();
+                return false;
+            }
+            _ => self.close_context_menu(),
         }
         true
     }
@@ -1228,27 +1257,27 @@ impl App {
     }
 
     fn draw_search_bar(&mut self) {
-        let label = {
-            let Some(search) = &self.search else {
-                return;
-            };
-            let (current, total) = self.terminal.search_summary();
-            if search.query.is_empty() {
-                "Find: ".to_string()
-            } else {
-                format!("Find: {}  {}/{}", search.query, current, total)
-            }
+        let Some(query) = self.search.as_ref().map(|search| search.query.clone()) else {
+            return;
+        };
+        let (current, total) = self.terminal.search_summary();
+        let max_cells = self.terminal.width().saturating_sub(2).max(1);
+        let prefix = "Find: ";
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("  {current}/{total}")
+        };
+        let reserved = prefix.width() + suffix.width();
+        let display = if reserved >= max_cells {
+            tail_to_width(&format!("{prefix}{query}"), max_cells)
+        } else {
+            let available = max_cells - reserved;
+            format!("{prefix}{}{suffix}", tail_to_width(&query, available))
         };
         let cell_width = self.cell_width as i32;
         let cell_height = self.cell_height as i32;
-        let max_chars = self.terminal.width().saturating_sub(2).max(1);
-        let measured = label.chars().count();
-        let display: String = if measured <= max_chars {
-            label
-        } else {
-            label.chars().skip(measured - max_chars).collect()
-        };
-        let width = (display.chars().count() as i32 + 2) * cell_width;
+        let width = (display.width() as i32 + 2) * cell_width;
         let height = cell_height + 4;
         let (origin_x, origin_y) = self.origin();
         let text_width = self.terminal.width() as i32 * cell_width;
@@ -1354,6 +1383,12 @@ impl App {
             true
         };
         let (origin_x, origin_y) = self.origin();
+        // An overlay stays in place while the terminal scrolls, so the canvas
+        // shift would leave a stale copy behind. Redraw everything instead.
+        if damage.scroll != 0 && (self.search.is_some() || self.context_menu.is_some()) {
+            damage.all = true;
+            damage.rows = vec![true; self.terminal.height()];
+        }
         // A whole-screen scroll only moves pixels. Shift the canvas once and
         // let the newly exposed rows be redrawn, instead of rasterizing every
         // cell. Presentation still needs the whole canvas since it all moved.
@@ -1462,6 +1497,43 @@ impl App {
     }
 }
 
+fn tail_to_width(text: &str, max: usize) -> String {
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for ch in text.chars().rev() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > max {
+            break;
+        }
+        used += width;
+        kept.push(ch);
+    }
+    kept.into_iter().rev().collect()
+}
+
+fn is_modifier_key(keysym: u32) -> bool {
+    matches!(
+        keysym,
+        key::Shift_L
+            | key::Shift_R
+            | key::Control_L
+            | key::Control_R
+            | key::Alt_L
+            | key::Alt_R
+            | key::Meta_L
+            | key::Meta_R
+            | key::Super_L
+            | key::Super_R
+            | key::Hyper_L
+            | key::Hyper_R
+            | key::ISO_Level3_Shift
+            | key::Mode_switch
+            | key::Caps_Lock
+            | key::Shift_Lock
+            | key::Num_Lock
+    )
+}
+
 fn parse_cursor_style(value: &str) -> CursorStyle {
     match value.to_ascii_lowercase().as_str() {
         "beam" | "bar" => CursorStyle::Beam,
@@ -1477,5 +1549,25 @@ impl From<Mods> for crate::vt::MouseMods {
             alt: mods.alt,
             ctrl: mods.control,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_truncation_counts_display_cells() {
+        assert_eq!(tail_to_width("abcdef", 3), "def");
+        assert_eq!(tail_to_width("\u{4e16}\u{754c}ab", 3), "ab");
+        assert_eq!(tail_to_width("\u{4e16}\u{754c}ab", 4), "\u{754c}ab");
+    }
+
+    #[test]
+    fn modifier_presses_do_not_dismiss_menus() {
+        assert!(is_modifier_key(key::Shift_L));
+        assert!(is_modifier_key(key::Control_R));
+        assert!(!is_modifier_key(key::Escape));
+        assert!(!is_modifier_key(key::f));
     }
 }
