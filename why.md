@@ -62,7 +62,7 @@ It is meant to be a terminal emulator that you can count on to always launch!
 | Transparency | yes, background | needs patch | yes, whole window incl. text | yes, background |
 | Mouse reporting | yes | yes | yes | yes |
 | OSC 52 clipboard | yes | needs patch | yes | yes |
-| Search / Vi mode | no | no | yes | yes |
+| Search / Vi mode | yes / no | no | yes | yes |
 | Ligatures | no | no | no | yes |
 
 See [PERFORMANCE.md](PERFORMANCE.md) for benchmarks.
