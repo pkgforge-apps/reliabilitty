@@ -1010,9 +1010,9 @@ fn missing_glyph(canvas: &mut Canvas, x: i32, y: i32, width: i32, height: i32, c
 
 fn search_background(theme: &Theme, current: bool) -> Rgb {
     if current {
-        theme.palette[12]
+        theme.search_current_background
     } else {
-        theme.palette[3]
+        theme.search_match_background
     }
 }
 
@@ -1093,6 +1093,16 @@ mod tests {
     fn search_highlights_use_a_readable_foreground() {
         assert_eq!(readable_on([240, 198, 116]), [0, 0, 0]);
         assert_eq!(readable_on([16, 16, 16]), [255, 255, 255]);
+    }
+
+    #[test]
+    fn search_colours_do_not_follow_the_ansi_palette() {
+        let mut colors = crate::config::ColorsConfig::default();
+        colors.normal.yellow = Some("#000000".into());
+        colors.bright.blue = Some("#000000".into());
+        let theme = Theme::from_config(&colors).unwrap();
+        assert_eq!(search_background(&theme, false), [0xf0, 0xc6, 0x74]);
+        assert_eq!(search_background(&theme, true), [0x7a, 0xa6, 0xda]);
     }
 
     #[test]

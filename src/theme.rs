@@ -12,6 +12,8 @@ pub struct Theme {
     pub cursor_text: Rgb,
     pub selection_background: Rgb,
     pub selection_foreground: Rgb,
+    pub search_match_background: Rgb,
+    pub search_current_background: Rgb,
     pub bright_foreground: Rgb,
     pub dim_foreground: Rgb,
     pub palette: [Rgb; 256],
@@ -32,6 +34,8 @@ impl Theme {
         };
         let selection_background = parse(&config.selection.background)?;
         let selection_foreground = parse(&config.selection.text)?;
+        let search_match_background = parse(&config.search.match_background)?;
+        let search_current_background = parse(&config.search.current_background)?;
         let bright_foreground = match &config.primary.bright_foreground {
             Some(value) => parse(value)?,
             None => foreground,
@@ -96,6 +100,8 @@ impl Theme {
             cursor_text,
             selection_background,
             selection_foreground,
+            search_match_background,
+            search_current_background,
             bright_foreground,
             dim_foreground,
             palette,

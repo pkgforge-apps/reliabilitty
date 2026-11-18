@@ -159,6 +159,7 @@ pub struct ColorsConfig {
     pub primary: PrimaryColors,
     pub cursor: CursorColors,
     pub selection: SelectionColors,
+    pub search: SearchColors,
     pub normal: AnsiColors,
     pub bright: AnsiColors,
     pub dim: Option<AnsiColors>,
@@ -170,6 +171,7 @@ impl Default for ColorsConfig {
             primary: PrimaryColors::default(),
             cursor: CursorColors::default(),
             selection: SelectionColors::default(),
+            search: SearchColors::default(),
             normal: AnsiColors::normal_default(),
             bright: AnsiColors::bright_default(),
             dim: None,
@@ -213,6 +215,25 @@ impl Default for SelectionColors {
         Self {
             background: "#373b41".into(),
             text: "#c5c8c6".into(),
+        }
+    }
+}
+
+/// Backgrounds of the search highlights. The text colour is chosen from the
+/// background luminance, so these two always stay readable.
+#[derive(Clone, Debug)]
+pub struct SearchColors {
+    /// Background of every non-current match.
+    pub match_background: String,
+    /// Background of the match the search is currently on.
+    pub current_background: String,
+}
+
+impl Default for SearchColors {
+    fn default() -> Self {
+        Self {
+            match_background: "#f0c674".into(),
+            current_background: "#7aa6da".into(),
         }
     }
 }
@@ -549,6 +570,8 @@ fn apply_key(config: &mut Config, key: &str, value: &str) -> Result<bool, String
         "CURSOR_TEXT_COLOR" => config.colors.cursor.text = Some(value.into()),
         "SELECTION_BACKGROUND" => config.colors.selection.background = value.into(),
         "SELECTION_FOREGROUND" => config.colors.selection.text = value.into(),
+        "SEARCH_MATCH_BACKGROUND" => config.colors.search.match_background = value.into(),
+        "SEARCH_CURRENT_BACKGROUND" => config.colors.search.current_background = value.into(),
         key if key.starts_with("COLOR_") => {
             let index: usize = key[6..]
                 .parse()
@@ -775,6 +798,8 @@ mod tests {
         assert_eq!(config.font.cell_width, Some(6));
         apply_key(&mut config, "COLOR_1", "#ff0000").unwrap();
         assert_eq!(config.colors.normal.red.as_deref(), Some("#ff0000"));
+        apply_key(&mut config, "SEARCH_CURRENT_BACKGROUND", "#112233").unwrap();
+        assert_eq!(config.colors.search.current_background, "#112233");
     }
 
     #[test]

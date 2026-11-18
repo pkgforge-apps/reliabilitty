@@ -155,9 +155,11 @@ See [`rtty.example.conf`](rtty.example.conf) for every option.
 | Double click / triple click | Select word / line |
 
 While the search bar is open, typing edits the query, Enter and Shift+Enter
-move to the next and previous match, and Escape closes it. Ctrl+F is left to
-the shell and full-screen applications; bind it to `search` in the config to
-use it for the search bar instead.
+move to the next and previous match, and Escape closes it. Search highlights
+use `SEARCH_MATCH_BACKGROUND` and `SEARCH_CURRENT_BACKGROUND`, with text
+contrast chosen automatically. Ctrl+F is left to the shell and full-screen
+applications; bind it to `search` in the config to use it for the search bar
+instead.
 
 Any `BINDING` lines in the config replace the built-in list completely.
 
