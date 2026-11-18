@@ -104,6 +104,7 @@ struct App {
     last_click: Option<Click>,
     context_menu: Option<ContextMenu>,
     search: Option<SearchUi>,
+    search_stale: bool,
     auto_scroll_at: Instant,
     next_config_check: Instant,
     force_reload: bool,
@@ -268,6 +269,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         last_click: None,
         context_menu: None,
         search: None,
+        search_stale: false,
         auto_scroll_at: now,
         next_config_check: now + Duration::from_secs(2),
         force_reload: false,
@@ -311,9 +313,7 @@ impl App {
             // are replaced before they reach the screen.
             if self.read_pty() {
                 self.last_pty_input = now;
-                if self.search.is_some() {
-                    self.terminal.refresh_search();
-                }
+                self.search_stale = true;
             }
             self.terminal_notifications(now);
             self.flush_input();
@@ -436,9 +436,7 @@ impl App {
         if let Some((action, chars)) = bound {
             if let Some(chars) = chars {
                 if self.search.is_some() {
-                    for ch in chars.chars() {
-                        self.search_push(ch);
-                    }
+                    self.search_push_str(&chars);
                 } else {
                     self.terminal.scroll_to_bottom();
                     self.terminal.push_input(chars.as_bytes());
@@ -474,7 +472,7 @@ impl App {
             self.redraw_all = true;
             return;
         }
-        if keysym == key::BackSpace || keysym == key::Delete {
+        if keysym == key::BackSpace {
             if let Some(search) = &mut self.search {
                 search.query.pop();
             }
@@ -514,11 +512,19 @@ impl App {
     }
 
     fn apply_search_query(&mut self) {
-        let Some(query) = self.search.as_ref().map(|search| search.query.clone()) else {
+        let Some(query) = self.search.as_ref().map(|search| search.query.as_str()) else {
             return;
         };
-        self.terminal.set_search_query(&query);
+        self.terminal.set_search_query(query);
+        self.search_stale = false;
         self.redraw_all = true;
+    }
+
+    fn refresh_active_search(&mut self) {
+        let Some(query) = self.search.as_ref().map(|search| search.query.as_str()) else {
+            return;
+        };
+        self.terminal.refresh_search(query);
     }
 
     fn open_search(&mut self) {
@@ -527,6 +533,7 @@ impl App {
                 query: String::new(),
             });
             self.terminal.set_search_query("");
+            self.search_stale = false;
             self.redraw_all = true;
         }
     }
@@ -534,6 +541,7 @@ impl App {
     fn close_search(&mut self) {
         if self.search.take().is_some() {
             self.terminal.clear_search();
+            self.search_stale = false;
             self.redraw_all = true;
         }
     }
@@ -650,7 +658,7 @@ impl App {
         let cell_width = self.cell_width as i32;
         let cell_height = self.cell_height as i32;
         let width = ((longest + 4).max(10) * cell_width).min(self.x11.width() as i32);
-        let height = entries.len() as i32 * cell_height + 4;
+        let height = (entries.len() as i32 * cell_height + 4).min(self.x11.height() as i32);
         let max_x = (self.x11.width() as i32 - width).max(0);
         let max_y = (self.x11.height() as i32 - height).max(0);
         (
@@ -670,11 +678,14 @@ impl App {
             return None;
         }
         let relative = y - menu_y - 2;
-        if relative < 0 {
-            return None;
-        }
-        let row = relative / self.cell_height.max(1) as i32;
-        entries.get(row as usize).map(|(item, _, _)| *item)
+        let row = menu_row_at(relative, self.cell_height as i32, entries.len())?;
+        entries.get(row).map(|(item, _, _)| *item)
+    }
+
+    fn menu_item_enabled(&self, item: MenuItem) -> bool {
+        self.menu_entries()
+            .iter()
+            .any(|(entry, _, enabled)| *entry == item && *enabled)
     }
 
     fn open_context_menu(&mut self, x: i16, y: i16) {
@@ -697,13 +708,25 @@ impl App {
         }
         match button {
             1 => {
-                let item = self.menu_item_at(&menu, x, y);
+                let (menu_x, menu_y, width, height) = self.menu_geometry(&menu);
+                let x32 = x as i32;
+                let y32 = y as i32;
+                let inside =
+                    x32 >= menu_x && x32 < menu_x + width && y32 >= menu_y && y32 < menu_y + height;
+                let item = if inside {
+                    self.menu_item_at(&menu, x, y)
+                } else {
+                    None
+                };
                 self.close_context_menu();
-                if let Some(item) = item {
+                if let Some(item) = item
+                    && self.menu_item_enabled(item)
+                {
                     self.perform_menu_item(item, time);
                 }
+                return inside;
             }
-            2 | 4 | 5 => {
+            2..=5 => {
                 self.close_context_menu();
                 return false;
             }
@@ -1246,7 +1269,9 @@ impl App {
             self.terminal.mark_all();
         }
         if self.search.is_some() {
-            self.terminal.refresh_search();
+            self.refresh_active_search();
+            self.terminal.reveal_search();
+            self.search_stale = false;
         }
         self.redraw_all = true;
     }
@@ -1257,23 +1282,26 @@ impl App {
     }
 
     fn draw_search_bar(&mut self) {
-        let Some(query) = self.search.as_ref().map(|search| search.query.clone()) else {
-            return;
-        };
-        let (current, total) = self.terminal.search_summary();
-        let max_cells = self.terminal.width().saturating_sub(2).max(1);
-        let prefix = "Find: ";
-        let suffix = if query.is_empty() {
-            String::new()
-        } else {
-            format!("  {current}/{total}")
-        };
-        let reserved = prefix.width() + suffix.width();
-        let display = if reserved >= max_cells {
-            tail_to_width(&format!("{prefix}{query}"), max_cells)
-        } else {
-            let available = max_cells - reserved;
-            format!("{prefix}{}{suffix}", tail_to_width(&query, available))
+        let display = {
+            let Some(search) = &self.search else {
+                return;
+            };
+            let query = &search.query;
+            let (current, total) = self.terminal.search_summary();
+            let max_cells = self.terminal.width().saturating_sub(2).max(1);
+            let prefix = "Find: ";
+            let suffix = if query.is_empty() {
+                String::new()
+            } else {
+                format!("  {current}/{total}")
+            };
+            let reserved = prefix.width() + suffix.width();
+            if reserved >= max_cells {
+                tail_to_width(&format!("{prefix}{query}"), max_cells)
+            } else {
+                let available = max_cells - reserved;
+                format!("{prefix}{}{suffix}", tail_to_width(query, available))
+            }
         };
         let cell_width = self.cell_width as i32;
         let cell_height = self.cell_height as i32;
@@ -1364,6 +1392,10 @@ impl App {
     }
 
     fn render(&mut self, now: Instant) {
+        if self.search.is_some() && self.search_stale {
+            self.search_stale = false;
+            self.refresh_active_search();
+        }
         let mut damage = self.terminal.take_damage();
         if self.redraw_all {
             damage.all = true;
@@ -1497,6 +1529,14 @@ impl App {
     }
 }
 
+fn menu_row_at(relative_y: i32, cell_height: i32, rows: usize) -> Option<usize> {
+    if relative_y < 0 || cell_height <= 0 {
+        return None;
+    }
+    let row = (relative_y / cell_height) as usize;
+    (row < rows).then_some(row)
+}
+
 fn tail_to_width(text: &str, max: usize) -> String {
     let mut kept = Vec::new();
     let mut used = 0;
@@ -1561,6 +1601,14 @@ mod tests {
         assert_eq!(tail_to_width("abcdef", 3), "def");
         assert_eq!(tail_to_width("\u{4e16}\u{754c}ab", 3), "ab");
         assert_eq!(tail_to_width("\u{4e16}\u{754c}ab", 4), "\u{754c}ab");
+    }
+
+    #[test]
+    fn menu_rows_skip_padding_and_overflow() {
+        assert_eq!(menu_row_at(0, 20, 4), Some(0));
+        assert_eq!(menu_row_at(20, 20, 4), Some(1));
+        assert_eq!(menu_row_at(-2, 20, 4), None);
+        assert_eq!(menu_row_at(80, 20, 4), None);
     }
 
     #[test]

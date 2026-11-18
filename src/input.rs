@@ -134,7 +134,6 @@ fn default_bindings() -> Vec<Binding> {
     add("V", "Control|Shift", Action::Paste);
     add("Insert", "Shift", Action::Paste);
     add("Insert", "Control", Action::Copy);
-    add("F", "Control", Action::Search);
     add("F", "Control|Shift", Action::Search);
     add("PageUp", "Shift", Action::ScrollPageUp);
     add("PageDown", "Shift", Action::ScrollPageDown);
@@ -744,10 +743,23 @@ mod default_binding_tests {
             key::f,
             Mods {
                 control: true,
+                shift: true,
                 ..Mods::default()
             },
         );
         assert!(binding.is_some(), "search binding missing");
         assert_eq!(binding.unwrap().action(), Some(&Action::Search));
+        assert!(
+            bindings
+                .find(
+                    key::f,
+                    Mods {
+                        control: true,
+                        ..Mods::default()
+                    },
+                )
+                .is_none(),
+            "Ctrl+F should stay available to the shell"
+        );
     }
 }

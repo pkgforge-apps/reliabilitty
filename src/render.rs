@@ -570,12 +570,12 @@ impl Renderer {
             bg = theme.selection_background;
         }
         if let Some(current) = highlight {
-            fg = theme.background;
             bg = if current {
-                theme.palette[3]
-            } else {
                 theme.palette[11]
+            } else {
+                theme.palette[3]
             };
+            fg = readable_on(bg);
         }
         let attrs = cell.attrs;
         if attrs.contains(Attrs::REVERSE) {
@@ -1012,6 +1012,15 @@ fn missing_glyph(canvas: &mut Canvas, x: i32, y: i32, width: i32, height: i32, c
     canvas.fill_rect(right - 1, top, 1, bottom - top, color);
 }
 
+fn readable_on(color: Rgb) -> Rgb {
+    let luminance = (299 * color[0] as u32 + 587 * color[1] as u32 + 114 * color[2] as u32) / 1000;
+    if luminance > 140 {
+        [0, 0, 0]
+    } else {
+        [255, 255, 255]
+    }
+}
+
 fn outline(canvas: &mut Canvas, x: i32, y: i32, width: i32, height: i32, color: u32) {
     canvas.fill_rect(x, y, width, 1, color);
     canvas.fill_rect(x, y + height - 1, width, 1, color);
@@ -1074,6 +1083,12 @@ mod tests {
         });
         let desc = FontDescription::default();
         assert!(query_face(&database, &desc, Weight::NORMAL, Style::Normal).is_some());
+    }
+
+    #[test]
+    fn search_highlights_use_a_readable_foreground() {
+        assert_eq!(readable_on([240, 198, 116]), [0, 0, 0]);
+        assert_eq!(readable_on([16, 16, 16]), [255, 255, 255]);
     }
 
     #[test]

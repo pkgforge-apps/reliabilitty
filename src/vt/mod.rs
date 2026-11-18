@@ -229,7 +229,6 @@ pub struct SearchMatch {
 
 #[derive(Clone, Debug, Default)]
 struct SearchState {
-    query: String,
     matches: Vec<SearchMatch>,
     current: usize,
 }
@@ -702,40 +701,22 @@ impl Terminal {
     }
 
     /// Replaces the search text and selects the nearest match at or below the
-    /// top of the current view. An empty query clears every highlight.
+    /// top of the current view, or the last match above it when none is below.
+    /// An empty query clears every highlight.
     pub fn set_search_query(&mut self, query: &str) {
-        let previous = self
-            .search
-            .as_ref()
-            .and_then(|state| state.matches.get(state.current).copied());
-        let same_query = self
-            .search
-            .as_ref()
-            .is_some_and(|state| state.query == query);
-        let matches = self.find_matches(query);
-        let current = if same_query {
-            previous
-                .and_then(|previous| matches.iter().position(|item| *item == previous))
-                .unwrap_or(0)
-        } else {
-            let order: HashMap<u64, usize> = self
-                .search_lines()
-                .iter()
-                .enumerate()
-                .map(|(index, line)| (line.id, index))
-                .collect();
-            let top = self
-                .visible_line(0)
-                .and_then(|line| order.get(&line.id).copied())
-                .unwrap_or(0);
-            matches
-                .iter()
-                .position(|item| order.get(&item.line).is_some_and(|index| *index >= top))
-                .unwrap_or(0)
-        };
+        let lines = self.search_lines();
+        let matches = self.find_matches_in(&lines, query);
+        let top = self
+            .visible_line(0)
+            .and_then(|line| lines.iter().position(|item| item.id == line.id))
+            .unwrap_or(0);
+        let current = matches
+            .iter()
+            .position(|(index, _)| *index >= top)
+            .or_else(|| matches.iter().rposition(|(index, _)| *index < top))
+            .unwrap_or(0);
         self.search = Some(SearchState {
-            query: query.to_string(),
-            matches,
+            matches: matches.into_iter().map(|(_, item)| item).collect(),
             current,
         });
         self.reveal_search_match();
@@ -744,13 +725,12 @@ impl Terminal {
 
     /// Recomputes matches after the screen changed, keeping the current match
     /// when it is still present.
-    pub fn refresh_search(&mut self) {
+    pub fn refresh_search(&mut self, query: &str) {
         let Some(state) = &self.search else {
             return;
         };
-        let query = state.query.clone();
         let previous = state.matches.get(state.current).copied();
-        let matches = self.find_matches(&query);
+        let matches = self.find_matches(query);
         let changed = matches != state.matches;
         let current = previous
             .and_then(|previous| matches.iter().position(|item| *item == previous))
@@ -762,6 +742,11 @@ impl Terminal {
         if changed {
             self.mark_all();
         }
+    }
+
+    /// Scrolls the current search match into view.
+    pub fn reveal_search(&mut self) {
+        self.reveal_search_match();
     }
 
     /// Removes the search state and its highlights.
@@ -785,6 +770,7 @@ impl Terminal {
         } else {
             (state.current + count - 1) % count
         };
+        self.mark_all();
         self.reveal_search_match();
         true
     }
@@ -814,25 +800,36 @@ impl Terminal {
     }
 
     fn find_matches(&self, query: &str) -> Vec<SearchMatch> {
+        let lines = self.search_lines();
+        self.find_matches_in(&lines, query)
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect()
+    }
+
+    fn find_matches_in(&self, lines: &[&Line], query: &str) -> Vec<(usize, SearchMatch)> {
         let needle: Vec<char> = query.chars().map(fold_search_char).collect();
         if needle.is_empty() {
             return Vec::new();
         }
         let mut matches = Vec::new();
-        for line in self.search_lines() {
+        for (index, line) in lines.iter().enumerate() {
             let (chars, columns) = self.search_text(line);
             let folded: Vec<char> = chars.iter().map(|ch| fold_search_char(*ch)).collect();
-            let mut index = 0;
-            while index + needle.len() <= folded.len() {
-                if folded[index..].starts_with(&needle) {
-                    matches.push(SearchMatch {
-                        line: line.id,
-                        start: columns[index],
-                        end: columns[index + needle.len() - 1],
-                    });
-                    index += needle.len();
+            let mut offset = 0;
+            while offset + needle.len() <= folded.len() {
+                if folded[offset..].starts_with(&needle) {
+                    matches.push((
+                        index,
+                        SearchMatch {
+                            line: line.id,
+                            start: columns[offset],
+                            end: columns[offset + needle.len() - 1],
+                        },
+                    ));
+                    offset += needle.len();
                 } else {
-                    index += 1;
+                    offset += 1;
                 }
             }
         }
@@ -840,9 +837,14 @@ impl Terminal {
     }
 
     fn search_text(&self, line: &Line) -> (Vec<char>, Vec<usize>) {
-        let mut chars = Vec::with_capacity(line.cells.len());
-        let mut columns = Vec::with_capacity(line.cells.len());
-        for (column, cell) in line.cells.iter().enumerate() {
+        let end = line
+            .cells
+            .iter()
+            .rposition(|cell| cell.width != 0 && (cell.ch != ' ' || cell.extra != 0))
+            .map_or(0, |index| index + 1);
+        let mut chars = Vec::with_capacity(end);
+        let mut columns = Vec::with_capacity(end);
+        for (column, cell) in line.cells[..end].iter().enumerate() {
             if cell.width == 0 {
                 continue;
             }
@@ -1992,6 +1994,10 @@ impl Terminal {
         self.theme = self.default_theme.clone();
         self.reset_tabs();
         self.selection = None;
+        if let Some(search) = &mut self.search {
+            search.matches.clear();
+            search.current = 0;
+        }
         self.dirty = vec![false; self.rows];
         self.dirty_all = true;
         self.wrap_pending = false;
@@ -2044,6 +2050,9 @@ fn is_word_char(ch: char) -> bool {
         )
 }
 
+/// Folds one character for case-insensitive search. This is single-character
+/// lowercasing, so multi-character folds such as the German sharp s are not
+/// treated as equal.
 fn fold_search_char(ch: char) -> char {
     ch.to_lowercase().next().unwrap_or(ch)
 }
@@ -2323,6 +2332,30 @@ mod tests {
         assert_eq!(terminal.search_summary(), (1, 3));
         assert!(terminal.search_step(false));
         assert_eq!(terminal.search_summary(), (3, 3));
+        let current = terminal.search_matches()[2];
+        terminal.refresh_search("alpha");
+        assert_eq!(terminal.search_summary(), (3, 3));
+        assert_eq!(terminal.search_matches()[2], current);
+    }
+
+    #[test]
+    fn search_starts_at_the_last_match_above_the_view() {
+        let mut terminal = terminal(2);
+        feed(
+            &mut terminal,
+            b"needle one\r\na\r\nb\r\nc\r\nd\r\nneedle two\r\ne\r\nf\r\ng",
+        );
+        terminal.set_search_query("needle");
+        assert_eq!(terminal.search_matches().len(), 2);
+        assert_eq!(terminal.search_summary(), (2, 2));
+    }
+
+    #[test]
+    fn search_ignores_trailing_line_padding() {
+        let mut terminal = terminal(2);
+        feed(&mut terminal, b"a");
+        terminal.set_search_query(" ");
+        assert!(terminal.search_matches().is_empty());
     }
 
     #[test]
