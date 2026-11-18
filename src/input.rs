@@ -45,6 +45,7 @@ pub enum Action {
     ResetFontSize,
     ClearSelection,
     SelectAll,
+    Search,
     ToggleFullscreen,
     SpawnNewInstance,
     Quit,
@@ -133,6 +134,8 @@ fn default_bindings() -> Vec<Binding> {
     add("V", "Control|Shift", Action::Paste);
     add("Insert", "Shift", Action::Paste);
     add("Insert", "Control", Action::Copy);
+    add("F", "Control", Action::Search);
+    add("F", "Control|Shift", Action::Search);
     add("PageUp", "Shift", Action::ScrollPageUp);
     add("PageDown", "Shift", Action::ScrollPageDown);
     add("Home", "Control|Shift", Action::ScrollToTop);
@@ -188,6 +191,7 @@ fn parse_action(text: &str) -> Result<Action, String> {
         "resetfontsize" => Action::ResetFontSize,
         "clearselection" => Action::ClearSelection,
         "selectall" => Action::SelectAll,
+        "search" | "find" => Action::Search,
         "togglefullscreen" => Action::ToggleFullscreen,
         "spawnnewinstance" => Action::SpawnNewInstance,
         "quit" | "close" => Action::Quit,
@@ -731,5 +735,19 @@ mod default_binding_tests {
             },
         );
         assert!(down.is_some(), "page down missing");
+    }
+
+    #[test]
+    fn search_binding_exists() {
+        let bindings = Bindings::new(&KeyboardConfig::default()).unwrap();
+        let binding = bindings.find(
+            key::f,
+            Mods {
+                control: true,
+                ..Mods::default()
+            },
+        );
+        assert!(binding.is_some(), "search binding missing");
+        assert_eq!(binding.unwrap().action(), Some(&Action::Search));
     }
 }

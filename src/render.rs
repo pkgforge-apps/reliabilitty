@@ -389,6 +389,12 @@ impl Renderer {
         self.cell_height
     }
 
+    /// Draws a single line of text with the regular font. Used for overlays
+    /// such as the search bar and the context menu.
+    pub fn draw_label(&mut self, canvas: &mut Canvas, text: &str, x: i32, y: i32, color: Rgb) {
+        self.draw_text_str(canvas, text, x, y, color, 0);
+    }
+
     /// Marks the configured primary family as already loaded, so fallback does
     /// not duplicate it.
     fn remember_primary_families(&mut self, config: &FontConfig) {
@@ -431,6 +437,8 @@ impl Renderer {
         let cell_h = self.cell_height as i32;
         let rows = terminal.height();
         let has_selection = terminal.has_selection();
+        let search = terminal.search_matches();
+        let search_current = terminal.search_current();
         for row in 0..rows {
             if !damage.all && !damage.rows.get(row).copied().unwrap_or(false) {
                 continue;
@@ -438,6 +446,12 @@ impl Renderer {
             let Some(line) = terminal.visible_line(row) else {
                 continue;
             };
+            let highlights: Vec<(usize, usize, bool)> = search
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.line == line.id)
+                .map(|(index, item)| (item.start, item.end, Some(index) == search_current))
+                .collect();
             let y0 = origin_y + row as i32 * cell_h;
             canvas.fill_rect(
                 origin_x,
@@ -454,6 +468,10 @@ impl Renderer {
                     continue;
                 }
                 let selected = has_selection && terminal.is_selected(line.id, col);
+                let highlight = highlights
+                    .iter()
+                    .find(|(start, end, _)| col >= *start && col <= *end)
+                    .map(|(_, _, current)| *current);
                 self.draw_cell(
                     canvas,
                     terminal,
@@ -461,6 +479,7 @@ impl Renderer {
                     origin_x + col as i32 * cell_w,
                     y0,
                     selected,
+                    highlight,
                     background_alpha,
                 );
             }
@@ -539,6 +558,7 @@ impl Renderer {
         x: i32,
         y: i32,
         selected: bool,
+        highlight: Option<bool>,
         background_alpha: u8,
     ) {
         let theme = terminal.theme();
@@ -549,6 +569,14 @@ impl Renderer {
             fg = theme.selection_foreground;
             bg = theme.selection_background;
         }
+        if let Some(current) = highlight {
+            fg = theme.background;
+            bg = if current {
+                theme.palette[3]
+            } else {
+                theme.palette[11]
+            };
+        }
         let attrs = cell.attrs;
         if attrs.contains(Attrs::REVERSE) {
             std::mem::swap(&mut fg, &mut bg);
@@ -557,7 +585,10 @@ impl Renderer {
             fg = bg;
         }
         let background = if canvas.argb {
-            let alpha = if cell.bg == Color::Default && !selected && !attrs.contains(Attrs::REVERSE)
+            let alpha = if cell.bg == Color::Default
+                && !selected
+                && highlight.is_none()
+                && !attrs.contains(Attrs::REVERSE)
             {
                 background_alpha
             } else {
