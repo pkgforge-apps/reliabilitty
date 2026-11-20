@@ -1,4 +1,15 @@
 
+## [0.1.15](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.14...v0.1.15) - 2026-11-20
+
+### Documentation
+
+- Add DOOM-fire frame rate benchmark ([#31](https://github.com/pkgforge-apps/reliabilitty/pull/31)) - ([cd07bc8](https://github.com/pkgforge-apps/reliabilitty/commit/cd07bc8204fef0a35882542a544be8942b78145e))
+- Refresh benchmarks for v0.1.14 with perf CPU measurements ([#29](https://github.com/pkgforge-apps/reliabilitty/pull/29)) - ([1a2eecf](https://github.com/pkgforge-apps/reliabilitty/commit/1a2eecf5c35e3c0289987a29d7b237fff1a20759))
+
+### Performance
+
+- Decouple PTY reads from rendering ([#33](https://github.com/pkgforge-apps/reliabilitty/pull/33)) - ([dcb68f5](https://github.com/pkgforge-apps/reliabilitty/commit/dcb68f50922f344cb4cb61cef81b816e562d97d6))
+
 ## [0.1.14](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.13...v0.1.14) - 2026-11-20
 
 ### Performance
