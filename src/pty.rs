@@ -119,29 +119,15 @@ impl Pty {
         self.master.as_raw_fd()
     }
 
-    /// Reads available output. `WouldBlock` means nothing is ready; zero means
-    /// the child closed the terminal.
-    pub fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        loop {
-            // SAFETY: buffer length is valid.
-            let result = unsafe {
-                libc::read(
-                    self.master.as_raw_fd(),
-                    buffer.as_mut_ptr() as *mut libc::c_void,
-                    buffer.len(),
-                )
-            };
-            if result >= 0 {
-                return Ok(result as usize);
-            }
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => return Err(error),
-                _ if error.raw_os_error() == Some(libc::EIO) => return Ok(0),
-                _ => return Err(error),
-            }
+    /// Duplicate the master fd for a background reader thread.
+    pub fn dup_reader(&self) -> io::Result<OwnedFd> {
+        // SAFETY: dup returns a fresh descriptor on success.
+        let fd = unsafe { libc::dup(self.master.as_raw_fd()) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
         }
+        // SAFETY: dup returned a valid, independently owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     pub fn queue(&mut self, bytes: &[u8]) {

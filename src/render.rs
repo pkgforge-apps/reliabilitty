@@ -652,6 +652,24 @@ impl Renderer {
         if cell.ch == ' ' && extra.is_none() {
             return;
         }
+        if extra.is_none() {
+            let half = (self.cell_height / 2) as i32;
+            let (oy, height) = match cell.ch {
+                '\u{2580}' => (0, half),
+                '\u{2584}' => (half, self.cell_height as i32 - half),
+                '\u{2588}' => (0, self.cell_height as i32),
+                _ => (0, 0),
+            };
+            if height > 0 {
+                let solid = if canvas.argb {
+                    argb(color, 255)
+                } else {
+                    rgb(color)
+                };
+                canvas.fill_rect(x, y + oy, self.cell_width as i32, height, solid);
+                return;
+            }
+        }
         let mut stack = [0u8; 8];
         let text: &str = match extra {
             None => cell.ch.encode_utf8(&mut stack),

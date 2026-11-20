@@ -1,8 +1,11 @@
-//! Application state and the single-threaded event loop.
+//! Application state and the event loop, with a background PTY reader.
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -84,6 +87,9 @@ struct App {
     config_modified: Option<SystemTime>,
     x11: X11,
     pty: Pty,
+    pty_rx: mpsc::Receiver<Vec<u8>>,
+    pty_wake: OwnedFd,
+    reader_stop: Arc<AtomicBool>,
     terminal: Terminal,
     parser: Parser,
     renderer: Renderer,
@@ -247,6 +253,73 @@ pub fn run(cli: Cli) -> Result<(), String> {
         x11.window_id(),
     )
     .map_err(|error| format!("cannot start the shell: {error}"))?;
+    let (pty_tx, pty_rx) = mpsc::sync_channel::<Vec<u8>>(256);
+    let reader_fd = pty.dup_reader().map_err(|error| error.to_string())?;
+    // SAFETY: eventfd returns a fresh descriptor or -1.
+    let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if wake < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: eventfd returned a valid, independently owned descriptor.
+    let pty_wake = unsafe { OwnedFd::from_raw_fd(wake) };
+    // SAFETY: dup returns a fresh descriptor on success.
+    let thread_wake = unsafe { libc::dup(wake) };
+    if thread_wake < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: dup returned a valid, independently owned descriptor.
+    let thread_wake = unsafe { OwnedFd::from_raw_fd(thread_wake) };
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let stop = reader_stop.clone();
+    std::thread::spawn(move || {
+        let mut pfd = libc::pollfd {
+            fd: reader_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut buffer = vec![0u8; 65536];
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            // SAFETY: pfd and count are valid.
+            let result = unsafe { libc::poll(&mut pfd, 1, 100) };
+            if result < 0 {
+                break;
+            }
+            if result == 0 {
+                continue;
+            }
+            loop {
+                // SAFETY: buffer length is valid.
+                let count = unsafe {
+                    libc::read(
+                        reader_fd.as_raw_fd(),
+                        buffer.as_mut_ptr() as *mut libc::c_void,
+                        buffer.len(),
+                    )
+                };
+                if count == 0 {
+                    return;
+                }
+                if count < 0 {
+                    break;
+                }
+                if pty_tx.send(buffer[..count as usize].to_vec()).is_err() {
+                    return;
+                }
+                let token: u64 = 1;
+                // SAFETY: thread_wake is a valid eventfd and token is 8 bytes.
+                unsafe {
+                    libc::write(
+                        thread_wake.as_raw_fd(),
+                        &token as *const u64 as *const libc::c_void,
+                        8,
+                    );
+                }
+            }
+        }
+    });
     let bindings = Bindings::new(&config.keyboard)?;
     let now = Instant::now();
     let mut app = App {
@@ -255,6 +328,9 @@ pub fn run(cli: Cli) -> Result<(), String> {
         config_modified,
         x11,
         pty,
+        pty_rx,
+        pty_wake,
+        reader_stop,
         terminal,
         parser: Parser::new(),
         renderer,
@@ -316,9 +392,18 @@ impl App {
             for event in events {
                 self.handle_event(event, now)?;
             }
-            // Drain the PTY before drawing. Rendering mid-burst blocks the
-            // child writer on the PTY buffer and wastes work on frames that
-            // are replaced before they reach the screen.
+            let mut token = [0u8; 8];
+            // SAFETY: pty_wake is a valid nonblocking eventfd; token is 8 bytes.
+            while unsafe {
+                libc::read(
+                    self.pty_wake.as_raw_fd(),
+                    token.as_mut_ptr() as *mut libc::c_void,
+                    8,
+                )
+            } == 8
+            {}
+            // Parse everything already buffered before drawing, so one frame
+            // shows the latest state instead of a half-parsed burst.
             if self.read_pty() {
                 self.last_pty_input = now;
                 self.search_stale = true;
@@ -334,9 +419,10 @@ impl App {
             if idle || now >= self.next_frame {
                 self.cursor_damage();
                 self.render(now);
-                self.next_frame = now + Duration::from_millis(100);
+                self.next_frame = now + Duration::from_millis(16);
             }
             if self.quit {
+                self.reader_stop.store(true, Ordering::Relaxed);
                 break;
             }
             self.wait(now)?;
@@ -1022,21 +1108,15 @@ impl App {
     }
 
     fn read_pty(&mut self) -> bool {
-        let mut buffer = [0u8; 65536];
         let mut read_any = false;
-        for _ in 0..64 {
-            match self.pty.read(&mut buffer) {
-                Ok(0) => {
-                    self.pty_eof = true;
-                    return read_any;
-                }
-                Ok(count) => {
+        for _ in 0..256 {
+            match self.pty_rx.try_recv() {
+                Ok(chunk) => {
                     read_any = true;
-                    self.parser.advance(&buffer[..count], &mut self.terminal);
+                    self.parser.advance(&chunk, &mut self.terminal);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return read_any,
-                Err(error) => {
-                    eprintln!("rtty: read: {error}");
+                Err(TryRecvError::Empty) => return read_any,
+                Err(TryRecvError::Disconnected) => {
                     self.pty_eof = true;
                     return read_any;
                 }
@@ -1530,6 +1610,11 @@ impl App {
             },
             libc::pollfd {
                 fd: self.signals.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.pty_wake.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },
