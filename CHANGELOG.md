@@ -1,4 +1,10 @@
 
+## [0.1.16](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.15...v0.1.16) - 2026-11-20
+
+### Performance
+
+- Fast-path indexed SGR and shorten frame interval ([#34](https://github.com/pkgforge-apps/reliabilitty/pull/34)) - ([758c1bb](https://github.com/pkgforge-apps/reliabilitty/commit/758c1bba608b688f7845ac840b3b1d4f6a760af2))
+
 ## [0.1.15](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.14...v0.1.15) - 2026-11-20
 
 ### Documentation
