@@ -181,28 +181,30 @@ throughput under backpressure, not frames actually presented on screen. The
 tool's own README calls the figure unscientific. It is included here because
 issue #12 asked for frame rate to be measured alongside latency.
 
-Every terminal was configured for a 160x30 grid with its own font, so the fire
-fills the window and each run renders the same number of cells (reported grids
-were 157-160 by 30). Transparency was disabled and each terminal got a clean
-config, with a private D-Bus session for xfce4-terminal and Ptyxis. The relay
-drove DOOM-fire for 8 seconds; values are the median FPS it reported.
+Every terminal was forced to the same 1440x660 window with i3 (floating) and
+its font tuned so it rendered close to 160x30 cells. The actual grids were
+143-160 columns by 30-33 rows, within about 10% of the target in each axis, so
+both the pixel area and the bytes per frame were comparable across terminals.
+Transparency was disabled and each terminal got a clean config with a private
+D-Bus session. The relay drove DOOM-fire for 8 or 12 seconds; values are the
+median FPS it reported.
 
 | # | Terminal | FPS |
 |--:|---|---:|
-| 1 | foot | 1209 |
-| 2 | Reliabilitty | 1103 |
-| 3 | Alacritty | 1040 |
-| 4 | Ghostty | 876 |
-| 5 | Ptyxis | 338 |
-| 6 | xfce4-terminal | 243 |
-| 7 | st | 196 |
+| 1 | Reliabilitty | 1073 |
+| 2 | foot | 1054 |
+| 3 | Alacritty | 1009 |
+| 4 | Ghostty | 843 |
+| 5 | Ptyxis | 321 |
+| 6 | xfce4-terminal | 278 |
+| 7 | st | 197 |
 
-These are indicative, not a strict ranking. The same 160x30 cells cover very
-different pixel areas because each terminal uses its own font: roughly
-960x390 for st and foot, up to 1440x660 for Alacritty and Ghostty. foot and
-Reliabilitty had the smallest windows, which flatters their numbers, while
-Alacritty and Ghostty painted about three times the pixels. The draw, CPU and
-vtebench results above are the better evidence for the speed claims.
+Reliabilitty, foot and Alacritty are within the run-to-run spread of each
+other; the GPU terminals are not ahead here. Ptyxis ignores the i3 resize, so
+it was measured in its native 160x30 window of 1440x658 instead, only 2 pixels
+shorter than the common window. foot runs under 12to11, so its compositor's
+rendering work is not counted in its number. The draw, CPU and vtebench results
+above remain the better evidence for the speed claims.
 
 DOOM-fire's `mem:` line is the per-frame output buffer size (about 16 KiB
 minimum, 96 KiB average and 100 KiB maximum in these runs), not process RAM.
