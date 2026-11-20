@@ -4,6 +4,14 @@ use super::{Attrs, Cell, Color, MouseEncoding, MouseMode, Terminal, base64_decod
 use crate::config::parse_color;
 
 impl Terminal {
+    pub(super) fn set_indexed_fg(&mut self, index: u8) {
+        self.pen.fg = Color::Indexed(index);
+    }
+
+    pub(super) fn set_indexed_bg(&mut self, index: u8) {
+        self.pen.bg = Color::Indexed(index);
+    }
+
     pub(super) fn esc_dispatch(&mut self, intermediates: &[u8], final_byte: u8) {
         match intermediates {
             [] => match final_byte {

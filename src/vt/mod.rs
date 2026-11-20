@@ -1698,7 +1698,7 @@ impl Terminal {
             {
                 let line = self.line_mut(y);
                 while let Some(&ch) = rest.peek() {
-                    let width = if ch.is_ascii() {
+                    let width = if ch.is_ascii() || ('\u{2580}'..='\u{259f}').contains(&ch) {
                         1
                     } else {
                         ch.width().unwrap_or(0)

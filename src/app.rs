@@ -419,7 +419,7 @@ impl App {
             if idle || now >= self.next_frame {
                 self.cursor_damage();
                 self.render(now);
-                self.next_frame = now + Duration::from_millis(16);
+                self.next_frame = now + Duration::from_millis(8);
             }
             if self.quit {
                 self.reader_stop.store(true, Ordering::Relaxed);

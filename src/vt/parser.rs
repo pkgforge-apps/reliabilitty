@@ -113,6 +113,35 @@ fn parse_cursor_position(bytes: &[u8]) -> Option<(u32, u32, usize)> {
     Some((row, col, i + 1))
 }
 
+/// Matches `CSI 38 ; 5 ; N m` and `CSI 48 ; 5 ; N m`, the common indexed-color
+/// form. Returns (is_foreground, color, length).
+fn parse_indexed_color(bytes: &[u8]) -> Option<(bool, u8, usize)> {
+    if bytes.len() < 9 || bytes[0] != 0x1b || bytes[1] != b'[' {
+        return None;
+    }
+    let foreground = match (bytes[2], bytes[3]) {
+        (b'3', b'8') => true,
+        (b'4', b'8') => false,
+        _ => return None,
+    };
+    if bytes[4] != b';' || bytes[5] != b'5' || bytes[6] != b';' {
+        return None;
+    }
+    let mut value = 0u16;
+    let mut i = 7;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        value = value * 10 + (bytes[i] - b'0') as u16;
+        if value > 255 {
+            return None;
+        }
+        i += 1;
+    }
+    if i == 7 || bytes.get(i) != Some(&b'm') {
+        return None;
+    }
+    Some((foreground, value as u8, i + 1))
+}
+
 /// Parses a plain `ESC [ <digits> (;<digits>)* m` SGR into fixed arrays,
 /// matching the byte state machine's params/separators semantics. Returns the
 /// params, separators, count and bytes consumed. Anything with a private
@@ -213,6 +242,18 @@ impl Parser {
                 && let Some((row, col, len)) = parse_cursor_position(&bytes[index..])
             {
                 terminal.csi_dispatch(0, &[], &[row, col], &[], b'H');
+                index += len;
+                continue;
+            }
+            if matches!(self.state, State::Ground)
+                && self.utf8.needed == 0
+                && let Some((foreground, color, len)) = parse_indexed_color(&bytes[index..])
+            {
+                if foreground {
+                    terminal.set_indexed_fg(color);
+                } else {
+                    terminal.set_indexed_bg(color);
+                }
                 index += len;
                 continue;
             }
@@ -730,6 +771,26 @@ mod tests {
             }
             assert_eq!(&params[..n], rp.as_slice(), "params for {:?}", bytes);
             assert_eq!(&seps[..n], rs.as_slice(), "seps for {:?}", bytes);
+        }
+    }
+
+    #[test]
+    fn indexed_color_fast_path_matches_byte_path_pen() {
+        for seq in [
+            b"\x1b[38;5;196m".as_slice(),
+            b"\x1b[48;5;21m",
+            b"\x1b[38;5;0m",
+            b"\x1b[48;5;255m",
+        ] {
+            let mut fast = terminal();
+            Parser::new().advance(seq, &mut fast);
+            let mut slow = terminal();
+            let mut parser = Parser::new();
+            for &byte in seq {
+                parser.byte(byte, &mut slow);
+            }
+            assert_eq!(fast.pen.fg, slow.pen.fg, "foreground for {seq:?}");
+            assert_eq!(fast.pen.bg, slow.pen.bg, "background for {seq:?}");
         }
     }
 
