@@ -1,4 +1,14 @@
 
+## [0.1.17](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.16...v0.1.17) - 2026-11-21
+
+### Features
+
+- Support OSC 8 hyperlinks with ctrl+click ([#39](https://github.com/pkgforge-apps/reliabilitty/pull/39)) - ([1fd9e2a](https://github.com/pkgforge-apps/reliabilitty/commit/1fd9e2ae12089f5fe56e19845e3278874ffb8240))
+
+### Performance
+
+- Derive frame interval from display refresh rate ([#36](https://github.com/pkgforge-apps/reliabilitty/pull/36)) - ([7cf7aba](https://github.com/pkgforge-apps/reliabilitty/commit/7cf7aba9d94ffe700c5465d657a49addee532a59))
+
 ## [0.1.16](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.15...v0.1.16) - 2026-11-20
 
 ### Performance
