@@ -1,4 +1,14 @@
 
+## [0.1.18](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.17...v0.1.18) - 2026-11-21
+
+### Documentation
+
+- Refresh benchmarks for v0.1.17 ([#40](https://github.com/pkgforge-apps/reliabilitty/pull/40)) - ([40b3b58](https://github.com/pkgforge-apps/reliabilitty/commit/40b3b5880341d6c0a7e0c2da3ad91043dd2511ef))
+
+### Performance
+
+- Defer scrollback reflow until resize settles ([#42](https://github.com/pkgforge-apps/reliabilitty/pull/42)) - ([2419e86](https://github.com/pkgforge-apps/reliabilitty/commit/2419e86b37aa896ad80d81c6996697c37851a1f6))
+
 ## [0.1.17](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.16...v0.1.17) - 2026-11-21
 
 ### Features
