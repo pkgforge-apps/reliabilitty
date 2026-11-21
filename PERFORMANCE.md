@@ -24,7 +24,7 @@ suite.
 
 | Terminal | Version | Renderer |
 |---|---|---|
-| Reliabilitty | 0.1.14 | CPU, swash |
+| Reliabilitty | 0.1.17 | CPU, swash |
 | Alacritty | 0.17.0 | GPU, OpenGL |
 | foot | 1.28.0 | CPU, fcft |
 | Ghostty | 1.4.0-arch1 | GPU, OpenGL |
@@ -52,61 +52,61 @@ suite.
 
 | # | Terminal | Launch time |
 |--:|---|---:|
-| 1 | Reliabilitty | 16.5 ms |
-| 2 | foot | 23.5 ms |
-| 3 | st | 45.1 ms |
-| 4 | Alacritty | 135.0 ms |
-| 5 | xfce4-terminal | 163.5 ms |
-| 6 | Ghostty | 198.5 ms |
-| 7 | Ptyxis | 320.3 ms |
+| 1 | Reliabilitty | 16.0 ms |
+| 2 | foot | 25.4 ms |
+| 3 | st | 43.1 ms |
+| 4 | Alacritty | 126.5 ms |
+| 5 | xfce4-terminal | 166.0 ms |
+| 6 | Ghostty | 193.9 ms |
+| 7 | Ptyxis | 324.2 ms |
 
 ### RSS
 
 | # | Terminal | RSS |
 |--:|---|---:|
 | 1 | st | 15.3 MiB |
-| 2 | foot | 23.4 MiB |
-| 3 | Reliabilitty | 26.8 MiB |
+| 2 | foot | 23.6 MiB |
+| 3 | Reliabilitty | 26.9 MiB |
 | 4 | xfce4-terminal | 79.8 MiB |
-| 5 | Alacritty | 95.6 MiB |
-| 6 | Ptyxis | 137.9 MiB |
-| 7 | Ghostty | 151.4 MiB |
+| 5 | Alacritty | 95.9 MiB |
+| 6 | Ptyxis | 138.6 MiB |
+| 7 | Ghostty | 152.0 MiB |
 
 ### PSS
 
 | # | Terminal | PSS |
 |--:|---|---:|
-| 1 | st | 4.6 MiB |
-| 2 | foot | 10.0 MiB |
-| 3 | Reliabilitty | 22.2 MiB |
-| 4 | xfce4-terminal | 31.0 MiB |
-| 5 | Alacritty | 45.5 MiB |
-| 6 | Ptyxis | 69.2 MiB |
-| 7 | Ghostty | 91.6 MiB |
+| 1 | st | 4.5 MiB |
+| 2 | foot | 9.9 MiB |
+| 3 | Reliabilitty | 22.3 MiB |
+| 4 | xfce4-terminal | 30.5 MiB |
+| 5 | Alacritty | 44.7 MiB |
+| 6 | Ptyxis | 68.2 MiB |
+| 7 | Ghostty | 90.6 MiB |
 
 ### 10000 lines
 
 | # | Terminal | Draw time |
 |--:|---|---:|
-| 1 | Reliabilitty | 34.0 ms |
-| 2 | foot | 41.3 ms |
-| 3 | st | 49.0 ms |
-| 4 | Alacritty | 132.4 ms |
-| 5 | xfce4-terminal | 157.5 ms |
-| 6 | Ghostty | 282.2 ms |
-| 7 | Ptyxis | 309.8 ms |
+| 1 | Reliabilitty | 28.6 ms |
+| 2 | foot | 40.1 ms |
+| 3 | st | 48.4 ms |
+| 4 | Alacritty | 130.0 ms |
+| 5 | xfce4-terminal | 161.3 ms |
+| 6 | Ghostty | 265.2 ms |
+| 7 | Ptyxis | 311.2 ms |
 
 ### CPU while drawing 10000 lines
 
 | # | Terminal | CPU time (perf task-clock) |
 |--:|---|---:|
-| 1 | Reliabilitty | 50.6 ms |
-| 2 | st | 51.2 ms |
-| 3 | xfce4-terminal | 65.6 ms |
+| 1 | Reliabilitty | 50.4 ms |
+| 2 | st | 49.8 ms |
+| 3 | xfce4-terminal | 62.7 ms |
 | 4 | foot | 88.3 ms |
-| 5 | Ptyxis | 99.5 ms |
-| 6 | Alacritty | 168.7 ms |
-| 7 | Ghostty | 447.0 ms |
+| 5 | Ptyxis | 96.3 ms |
+| 6 | Alacritty | 164.6 ms |
+| 7 | Ghostty | 450.4 ms |
 
 Reliabilitty and st are effectively tied on CPU time; both use a fraction of
 what the GPU terminals consume. foot's figure is a partial count because its
@@ -116,13 +116,13 @@ rendering runs in the 12to11 compositor process.
 
 | Terminal | Launch | RSS | PSS | Draw | CPU |
 |---|---:|---:|---:|---:|---:|
-| Reliabilitty | 16.5 ms | 26.8 MiB | 22.2 MiB | 34.0 ms | 50.6 ms |
-| Alacritty | 135.0 ms | 95.6 MiB | 45.5 MiB | 132.4 ms | 168.7 ms |
-| Ghostty | 198.5 ms | 151.4 MiB | 91.6 MiB | 282.2 ms | 447.0 ms |
-| Ptyxis | 320.3 ms | 137.9 MiB | 69.2 MiB | 309.8 ms | 99.5 ms |
-| st | 45.1 ms | 15.3 MiB | 4.6 MiB | 49.0 ms | 51.2 ms |
-| xfce4-terminal | 163.5 ms | 79.8 MiB | 31.0 MiB | 157.5 ms | 65.6 ms |
-| foot | 23.5 ms | 23.4 MiB | 10.0 MiB | 41.3 ms | 88.3 ms |
+| Reliabilitty | 16.0 ms | 26.9 MiB | 22.3 MiB | 28.6 ms | 50.4 ms |
+| Alacritty | 126.5 ms | 95.9 MiB | 44.7 MiB | 130.0 ms | 164.6 ms |
+| Ghostty | 193.9 ms | 152.0 MiB | 90.6 MiB | 265.2 ms | 450.4 ms |
+| Ptyxis | 324.2 ms | 138.6 MiB | 68.2 MiB | 311.2 ms | 96.3 ms |
+| st | 43.1 ms | 15.3 MiB | 4.5 MiB | 48.4 ms | 49.8 ms |
+| xfce4-terminal | 166.0 ms | 79.8 MiB | 30.5 MiB | 161.3 ms | 62.7 ms |
+| foot | 25.4 ms | 23.6 MiB | 9.9 MiB | 40.1 ms | 88.3 ms |
 
 Reliabilitty is fastest to launch, draws text fastest, and is tied with st for
 the least CPU use. st wins RSS and PSS because it is a smaller C process. The
@@ -135,8 +135,8 @@ why st and foot have an edge on RSS and PSS. mimalloc was briefly removed in
 v0.1.13, which cut RSS but regressed draw time and CPU, so it was restored in
 v0.1.14.
 
-The GPU terminals remain slightly ahead only on raw PTY read throughput: their
-vtebench totals are 662 ms and 703 ms versus Reliabilitty's 712 ms. On launch,
+The GPU terminals remain slightly ahead only on raw PTY read throughput:
+Alacritty's vtebench total is 660 ms versus Reliabilitty's 711 ms. On launch,
 draw time and CPU use they are several times slower. That does not make GPU
 rendering useless in every case, but for a normal terminal workload the CPU
 path is already cheap enough that the extra machinery buys very little.
@@ -152,25 +152,25 @@ benchmark). Values are mean milliseconds; lower is better.
 
 | Benchmark | Reliabilitty | Alacritty | foot | Ghostty | Ptyxis | st | xfce4-terminal |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| cursor_motion | 10 ms | 12 ms | 7 ms | 9 ms | 21 ms | 26 ms | 16 ms |
-| dense_cells | 32 ms | 32 ms | 68 ms | 33 ms | 98 ms | 1154 ms | 122 ms |
-| light_cells | 5 ms | 10 ms | 8 ms | 2 ms | 19 ms | 25 ms | 7 ms |
-| medium_cells | 8 ms | 12 ms | 15 ms | 10 ms | 20 ms | 34 ms | 18 ms |
-| scrolling | 127 ms | 111 ms | 131 ms | 130 ms | 202 ms | 385 ms | 195 ms |
-| scrolling_bottom_region | 128 ms | 110 ms | 127 ms | 118 ms | 193 ms | 381 ms | 187 ms |
-| scrolling_bottom_small_region | 127 ms | 113 ms | 128 ms | 122 ms | 198 ms | 340 ms | 199 ms |
-| scrolling_fullscreen | 6 ms | 12 ms | 7 ms | 27 ms | 21 ms | 27 ms | 15 ms |
-| scrolling_top_region | 125 ms | 114 ms | 127 ms | 121 ms | 226 ms | 334 ms | 236 ms |
-| scrolling_top_small_region | 126 ms | 114 ms | 129 ms | 119 ms | 204 ms | 340 ms | 221 ms |
-| sync_medium_cells | 8 ms | 13 ms | 14 ms | 10 ms | 20 ms | 36 ms | 19 ms |
-| unicode | 9 ms | 9 ms | 24 ms | 3 ms | 40 ms | 101 ms | 37 ms |
-| **Total** | **712 ms** | **662 ms** | **785 ms** | **703 ms** | **1262 ms** | **3183 ms** | **1272 ms** |
+| cursor_motion | 14 ms | 12 ms | 7 ms | 9 ms | 20 ms | 51 ms | 18 ms |
+| dense_cells | 53 ms | 32 ms | 65 ms | 32 ms | 86 ms | 698 ms | 93 ms |
+| light_cells | 7 ms | 10 ms | 8 ms | 2 ms | 6 ms | 25 ms | 6 ms |
+| medium_cells | 8 ms | 11 ms | 16 ms | 10 ms | 17 ms | 31 ms | 16 ms |
+| scrolling | 122 ms | 112 ms | 130 ms | 132 ms | 196 ms | 389 ms | 186 ms |
+| scrolling_bottom_region | 121 ms | 110 ms | 126 ms | 123 ms | 179 ms | 386 ms | 179 ms |
+| scrolling_bottom_small_region | 118 ms | 113 ms | 127 ms | 122 ms | 191 ms | 341 ms | 186 ms |
+| scrolling_fullscreen | 7 ms | 11 ms | 7 ms | 27 ms | 13 ms | 27 ms | 14 ms |
+| scrolling_top_region | 118 ms | 114 ms | 125 ms | 125 ms | 225 ms | 338 ms | 216 ms |
+| scrolling_top_small_region | 120 ms | 113 ms | 126 ms | 121 ms | 200 ms | 345 ms | 201 ms |
+| sync_medium_cells | 8 ms | 13 ms | 14 ms | 10 ms | 17 ms | 34 ms | 17 ms |
+| unicode | 15 ms | 9 ms | 24 ms | 3 ms | 33 ms | 165 ms | 49 ms |
+| **Total** | **711 ms** | **660 ms** | **775 ms** | **716 ms** | **1183 ms** | **2830 ms** | **1181 ms** |
 
-Alacritty and Ghostty lead on pure PTY read throughput, but only by a narrow
-margin: 662 ms and 703 ms in total versus Reliabilitty's 712 ms. The gap is
-inside the run-to-run spread. Reliabilitty is about 4.5x faster than st overall,
-ahead of both VTE terminals and foot, and leads the GPU terminals decisively on
-launch time, draw time and CPU use.
+Alacritty leads on pure PTY read throughput, but only by a narrow margin:
+660 ms in total versus Reliabilitty's 711 ms. The gap is inside the run-to-run
+spread. Reliabilitty is about 4x faster than st overall, ahead of both VTE
+terminals and foot, and leads the GPU terminals decisively on launch time, draw
+time and CPU use.
 
 ## Frame rate (DOOM-fire)
 
@@ -183,29 +183,41 @@ issue #12 asked for frame rate to be measured alongside latency.
 
 Every terminal was forced to the same 1440x660 window with i3 (floating) and
 its font tuned so it rendered close to 160x30 cells. The actual grids were
-118-160 columns by 30-40 rows, but every run had 4719-4929 cells, within 3% of
-the 4800 cells in a 160x30 grid, so both the pixel area and the bytes per frame
-were comparable across terminals. Transparency was disabled and each terminal
-got a clean config with a private D-Bus session. The relay drove DOOM-fire for
-8 or 12 seconds; values are the median FPS it reported.
+118-160 columns by 30-40 rows, but every run had roughly 4700-4900 cells, within
+a few percent of the 4800 cells in a 160x30 grid, so both the pixel area and the
+bytes per frame were comparable across terminals. Transparency was disabled and
+each terminal got a clean config with a private D-Bus session. The relay drove
+DOOM-fire for 8 or 12 seconds and reported the median FPS it wrote to the PTY.
 
-| # | Terminal | FPS |
-|--:|---|---:|
-| 1 | Reliabilitty | 1073 |
-| 2 | foot | 1054 |
-| 3 | Alacritty | 1009 |
-| 4 | Ghostty | 843 |
-| 5 | Ptyxis | 316 |
-| 6 | xfce4-terminal | 278 |
-| 7 | st | 197 |
+To measure frames actually presented on screen, the window was recorded with
+`ffmpeg -f x11grab -framerate 60 -f framemd5` and consecutive distinct frame
+hashes were counted. The 60 Hz capture is a ceiling on these numbers. Presented
+FPS below is the steady rate once the fire is running; the average over the
+whole capture is lower because it includes startup and teardown.
 
-Reliabilitty, foot and Alacritty are within the run-to-run spread of each
-other; the GPU terminals are not ahead here. foot runs under 12to11, so its
-compositor's rendering work is not counted in its number. The draw, CPU and
-vtebench results above remain the better evidence for the speed claims.
+| Terminal | Written to PTY | Presented, steady | Presented, peak |
+|---|---:|---:|---:|
+| Alacritty | 979 | 50 | 60 |
+| foot | 983 | 49 | 60 |
+| Ghostty | 856 | 49 | 60 |
+| Reliabilitty | 1148 | 48 | 60 |
+| Ptyxis | 329 | 34 | 42 |
+| xfce4-terminal | 281 | 20 | 26 |
+| st | 207 | 14 | 23 |
 
-DOOM-fire's `mem:` line is the per-frame output buffer size (about 16 KiB
-minimum, 96 KiB average and 100 KiB maximum in these runs), not process RAM.
+The two columns measure different things. Written-to-PTY is DOOM-fire's own
+reported FPS: how fast it can push frames into the terminal. Presented FPS is
+how often the terminal actually repainted. Reliabilitty writes far more frames
+than any other terminal but presents about as many as the GPU terminals,
+because its renderer coalesces bursts into one paint per display frame. The
+frame interval is derived from the display's refresh rate through RandR, so
+rtty paints at most once per frame instead of wasting work on frames the
+compositor would never show.
+
+foot runs under 12to11, so its compositor's rendering work is not counted. The
+draw, CPU and vtebench results above remain the better evidence for the speed
+claims. DOOM-fire's `mem:` line is the per-frame output buffer size (about 16
+KiB minimum, 96 KiB average and 100 KiB maximum in these runs), not process RAM.
 
 ## Ghostty and GTK4
 
