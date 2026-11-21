@@ -104,6 +104,15 @@ impl Cell {
     pub fn is_blank(&self) -> bool {
         self.ch == ' ' && self.extra == 0 && self.width != 0
     }
+
+    /// True for an unstyled blank: the cells a rewrap drops at the end of a
+    /// line. Styled blanks carry background colour and stay.
+    fn is_padding(&self) -> bool {
+        self.is_blank()
+            && self.fg == Color::Default
+            && self.bg == Color::Default
+            && self.attrs == Attrs::default()
+    }
 }
 
 /// A physical row, with a stable identity for selections.
@@ -113,7 +122,13 @@ pub struct Line {
     pub id: u64,
     /// Cells, always exactly the terminal width after a resize.
     pub cells: Vec<Cell>,
+    /// Set while the line is full and autowrap continues it on the next row.
+    /// A resize joins the rows of such a run and splits it at the new width.
     pub wrapped: bool,
+    /// Set when the row stopped short of its last column because a double
+    /// width character did not fit. The cell left at the margin is padding a
+    /// rewrap drops, so it does not reappear as a space in the copied text.
+    wide_wrap: bool,
     /// Columns written since the last clear. Cells outside the range are
     /// guaranteed blank, so recycling only has to clear the range.
     written_min: usize,
@@ -127,6 +142,7 @@ impl Line {
             id,
             cells,
             wrapped: false,
+            wide_wrap: false,
             written_min: usize::MAX,
             written_max: 0,
             revision: 0,
@@ -1320,36 +1336,36 @@ impl Terminal {
             return;
         }
         self.normalize_region();
+        let columns_changed = cols != self.cols;
         self.cols = cols;
         self.rows = rows;
-        for line in &mut self.main {
-            resize_line(line, cols);
-        }
-        if let Some(alt) = &mut self.alt {
-            for line in alt {
-                resize_line(line, cols);
+        // Only the primary screen has rows a rewrap joins. The alternate screen
+        // belongs to a full-screen application, which redraws itself from the
+        // new size, so its rows are just padded or cut.
+        let in_alt = self.in_alt();
+        let mut pending = false;
+        if columns_changed {
+            // The primary rows are reflowed even on the alternate screen, so a
+            // saved primary cursor is remapped; only the live cursor is restored
+            // here, and on the alternate screen it belongs to the application.
+            pending = self.reflow(!in_alt) && !in_alt;
+            if let Some(alt) = &mut self.alt {
+                for line in alt.iter_mut() {
+                    resize_line(line, cols);
+                }
             }
         }
-        for line in &mut self.scrollback {
-            resize_line(line, cols);
-        }
-        while self.main.len() < rows {
-            let line = self.new_line();
-            self.main.push_back(line);
-        }
-        self.main.truncate(rows);
-        if self.alt.as_ref().is_some_and(|alt| alt.len() < rows) {
+        if self.alt.is_some() {
             let mut extra = VecDeque::new();
             while self.alt.as_ref().map_or(0, VecDeque::len) + extra.len() < rows {
                 extra.push_back(self.new_line());
             }
             if let Some(alt) = &mut self.alt {
+                alt.truncate(rows);
                 alt.extend(extra);
             }
         }
-        if let Some(alt) = &mut self.alt {
-            alt.truncate(rows);
-        }
+        self.fit_height(!in_alt);
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
         self.cursor.x = self.cursor.x.min(cols - 1);
@@ -1360,7 +1376,229 @@ impl Terminal {
         self.dirty = vec![false; rows];
         self.dirty_all = true;
         self.last_printed = None;
-        self.wrap_pending = false;
+        self.wrap_pending = pending;
+    }
+
+    /// Rewraps the primary screen and its history for the current width. Rows an
+    /// autowrap continued (`Line::wrapped`) join into one logical line, lose the
+    /// blank cells that padded them and are split again at the width, so a
+    /// paragraph keeps its flow and no cell is stored twice.
+    ///
+    /// Returns whether the live cursor now sits at the margin of a full row,
+    /// which the caller turns back into a pending wrap.
+    fn reflow(&mut self, track_cursor: bool) -> bool {
+        let cols = self.cols;
+        let rows = self.rows;
+        let anchor = |line: usize, col: usize| (self.scrollback.len() + line, col);
+        let was_pending = self.wrap_pending;
+        // The live cursor and the two saved ones all address primary rows.
+        // They are mapped through the same reflow, so a later restore lands on
+        // the same text. Only the live cursor is left out when the alternate
+        // screen owns it, but the saved ones still have to move.
+        let marks = [
+            track_cursor.then(|| anchor(self.cursor.y, self.cursor.x)),
+            self.saved.as_ref().map(|saved| anchor(saved.y, saved.x)),
+            self.alt_saved
+                .as_ref()
+                .map(|saved| anchor(saved.y, saved.x)),
+        ];
+        let mut decided = [None; 3];
+        let mut source = std::mem::take(&mut self.scrollback);
+        source.extend(std::mem::take(&mut self.main));
+
+        let mut out: VecDeque<Line> = VecDeque::with_capacity(source.len());
+        let mut spare: Vec<Line> = Vec::new();
+        let mut content: Vec<Cell> = Vec::new();
+        let mut run: Vec<Line> = Vec::new();
+        let mut splits: Vec<(usize, usize)> = Vec::new();
+        let mut row = 0;
+        let mut source = source.into_iter();
+        while let Some(line) = source.next() {
+            // A row that is not continued and already fits only needs padding
+            // or cutting, which keeps a full scrollback cheap to resize.
+            if !line.wrapped && content_len(&line.cells) <= cols {
+                for (slot, mark) in decided.iter_mut().zip(marks.iter()) {
+                    if let Some((at, col)) = mark
+                        && slot.is_none()
+                        && *at == row
+                    {
+                        *slot = Some((out.len(), *col));
+                    }
+                }
+                let mut line = line;
+                resize_line(&mut line, cols);
+                out.push_back(line);
+                row += 1;
+                continue;
+            }
+            run.push(line);
+            while run.last().is_some_and(|line| line.wrapped) {
+                let Some(line) = source.next() else {
+                    break;
+                };
+                run.push(line);
+            }
+            content.clear();
+            let mut offsets = [None; 3];
+            for (index, line) in run.iter().enumerate() {
+                // The row that ends a logical line is padded. The rows an
+                // autowrap continued are full, except the margin cell a double
+                // width character left behind to take the next row.
+                let width = if line.wrapped && !line.wide_wrap {
+                    line.cells.len()
+                } else {
+                    content_len(&line.cells)
+                };
+                for (slot, mark) in offsets.iter_mut().zip(marks.iter()) {
+                    if let Some((at, col)) = mark
+                        && slot.is_none()
+                        && *at == row + index
+                    {
+                        *slot = Some(content.len() + (*col).min(width));
+                    }
+                }
+                content.extend_from_slice(&line.cells[..width]);
+            }
+            row += run.len();
+            spare.append(&mut run);
+            split(&content, cols, &mut splits);
+            let count = splits.len();
+            let start = out.len();
+            for (index, (from, to)) in splits.iter().enumerate() {
+                let mut line = spare.pop().unwrap_or_else(|| self.new_line());
+                line.id = self.next_line_id();
+                line.wrapped = index + 1 < count;
+                line.wide_wrap =
+                    *to < content.len() && content.get(*to).is_some_and(|cell| cell.width == 2);
+                line.cells.clear();
+                line.cells.extend_from_slice(&content[*from..*to]);
+                line.cells.resize(cols, Cell::blank());
+                line.mark_all_written();
+                out.push_back(line);
+            }
+            for (decided, offset) in decided.iter_mut().zip(offsets.iter()) {
+                if let Some(offset) = *offset {
+                    let index = splits
+                        .iter()
+                        .rposition(|(from, _)| *from <= offset)
+                        .unwrap_or(0);
+                    *decided = Some((start + index, offset - splits[index].0));
+                }
+            }
+        }
+
+        // Blank rows past the text are not content: trimming them first keeps a
+        // narrow window from spending its fresh rows on nothing and scrolling
+        // the prompt off the top.
+        let mut total = out.len();
+        while total > rows
+            && out[total - 1].cells.iter().all(Cell::is_padding)
+            && decided[0].is_none_or(|(line, _)| line + 1 < total)
+        {
+            total -= 1;
+        }
+        out.truncate(total);
+        let moved = total.saturating_sub(rows);
+        let mut scrollback: VecDeque<Line> = out.drain(..moved).collect();
+        while scrollback.len() > self.history {
+            scrollback.pop_front();
+        }
+        // Rows the screen has room for again come back above it, so the text
+        // below them stays where it was and the cursor moves down with it.
+        let mut restored = 0;
+        while out.len() < rows {
+            match scrollback.pop_back() {
+                Some(line) => {
+                    out.push_front(line);
+                    restored += 1;
+                }
+                None => {
+                    let line = self.new_line();
+                    out.push_back(line);
+                }
+            }
+        }
+        self.scrollback = scrollback;
+        self.main = out;
+        let placed = |(line, col): (usize, usize)| {
+            let y = (line + restored).saturating_sub(moved).min(rows - 1);
+            (y, col.min(cols - 1))
+        };
+        let mut pending = false;
+        if let Some((line, column)) = decided[0] {
+            let (y, x) = placed((line, column));
+            // A wrap that was pending before the resize still is when its text
+            // still reaches the margin, so the next character opens a row
+            // instead of overwriting the last one.
+            pending = was_pending && column + 1 == cols;
+            self.cursor.y = y;
+            self.cursor.x = x;
+        }
+        if let (Some(saved), Some(at)) = (&mut self.saved, decided[1]) {
+            (saved.y, saved.x) = placed(at);
+        }
+        if let (Some(saved), Some(at)) = (&mut self.alt_saved, decided[2]) {
+            (saved.y, saved.x) = placed(at);
+        }
+        // Anchors hold columns, and a rewrap changes them.
+        self.selection = None;
+        pending
+    }
+
+    /// Fits the primary screen to the current height, keeping its bottom in
+    /// place. Blank rows below the text are dropped first, so shrinking does
+    /// not scroll anything off the top for no reason. Every primary cursor
+    /// moves with its text; on the alternate screen only the saved ones do,
+    /// since the live cursor belongs to the application.
+    fn fit_height(&mut self, live: bool) {
+        let rows = self.rows;
+        let mut moved = 0isize;
+        while self.main.len() > rows
+            && self
+                .main
+                .back()
+                .is_some_and(|line| line.cells.iter().all(Cell::is_padding))
+        {
+            self.main.pop_back();
+        }
+        while self.main.len() > rows {
+            let line = self
+                .main
+                .pop_front()
+                .expect("main has more rows than it fits");
+            self.scrollback.push_back(line);
+            moved += 1;
+        }
+        while self.scrollback.len() > self.history {
+            self.scrollback.pop_front();
+        }
+        let mut restored = 0;
+        while self.main.len() < rows {
+            match self.scrollback.pop_back() {
+                Some(line) => {
+                    self.main.push_front(line);
+                    restored += 1;
+                }
+                None => {
+                    let line = self.new_line();
+                    self.main.push_back(line);
+                }
+            }
+        }
+        let shift = |y: usize| {
+            (y as isize + restored as isize - moved)
+                .max(0)
+                .min(rows as isize - 1) as usize
+        };
+        if live {
+            self.cursor.y = shift(self.cursor.y);
+        }
+        if let Some(saved) = &mut self.saved {
+            saved.y = shift(saved.y);
+        }
+        if let Some(saved) = &mut self.alt_saved {
+            saved.y = shift(saved.y);
+        }
     }
 
     pub fn set_window_pixels(&mut self, width: u16, height: u16) {
@@ -1472,6 +1710,7 @@ impl Terminal {
                 };
                 line.mark_written_range(x, x);
                 line.wrapped = false;
+                line.wide_wrap = false;
                 self.last_printed = Some((y, x));
                 self.last_graphic = ch;
                 self.mark_row(y);
@@ -1488,15 +1727,13 @@ impl Terminal {
         let width = width.min(2);
         if self.wrap_pending {
             if self.autowrap {
-                self.index();
-                self.cursor.x = 0;
+                self.wrap_line();
             }
             self.wrap_pending = false;
         }
         if width == 2 && self.cursor.x + 1 >= self.cols {
             if self.autowrap {
-                self.index();
-                self.cursor.x = 0;
+                self.wrap_wide();
             } else {
                 self.cursor.x = self.cols.saturating_sub(2);
             }
@@ -1555,6 +1792,7 @@ impl Terminal {
         line.cells[x] = cell;
         line.mark_written_range(x, x + width - 1);
         line.wrapped = false;
+        line.wide_wrap = false;
         self.last_printed = Some((y, x));
         self.last_graphic = ch;
         self.mark_row(y);
@@ -1607,7 +1845,8 @@ impl Terminal {
                 let mut x = x0;
                 let mut physical = map(start_y);
                 let mut row_start = x0;
-                for &byte in bytes {
+                lines[physical].wrapped = false;
+                for (index, &byte) in bytes.iter().enumerate() {
                     let line = &mut lines[physical];
                     let old = line.cells[x];
                     if old.width == 0 {
@@ -1634,15 +1873,20 @@ impl Terminal {
                         link,
                         width: 1,
                     };
-                    line.wrapped = false;
                     x += 1;
                     if x == cols {
                         line.mark_written_range(row_start, cols - 1);
                         x = 0;
                         row_start = 0;
+                        let filled = physical;
                         physical += 1;
                         if physical > region_bottom {
                             physical = region_top;
+                        }
+                        lines[physical].wrapped = false;
+                        lines[physical].wide_wrap = false;
+                        if index + 1 < bytes.len() {
+                            lines[filled].wrapped = true;
                         }
                     }
                 }
@@ -1668,8 +1912,7 @@ impl Terminal {
         while offset < bytes.len() {
             if self.wrap_pending {
                 if self.autowrap {
-                    self.index();
-                    self.cursor.x = 0;
+                    self.wrap_line();
                 }
                 self.wrap_pending = false;
                 self.last_printed = None;
@@ -1711,6 +1954,7 @@ impl Terminal {
                 }
                 line.mark_written_range(x0, x0 + segment.len() - 1);
                 line.wrapped = false;
+                line.wide_wrap = false;
                 segment[segment.len() - 1] as char
             };
             let end_x = x0 + segment.len();
@@ -1794,6 +2038,7 @@ impl Terminal {
                 if last.is_some() {
                     line.mark_written_range(start, x - 1);
                     line.wrapped = false;
+                    line.wide_wrap = false;
                 }
             }
             match last {
@@ -1973,6 +2218,28 @@ impl Terminal {
         }
     }
 
+    /// Marks the current row as continued and moves the cursor to column zero
+    /// of the row below. This is the only way a row gets `wrapped`, so a resize
+    /// knows exactly which rows to join.
+    fn wrap_line(&mut self) {
+        let y = self.cursor.y;
+        self.line_mut(y).wrapped = true;
+        self.index();
+        self.cursor.x = 0;
+    }
+
+    /// Continues the row below and leaves the margin cell it could not use as
+    /// padding, which is what a double width character needs when it does not
+    /// fit in the last column.
+    fn wrap_wide(&mut self) {
+        let y = self.cursor.y;
+        self.wrap_line();
+        let physical = self.physical_row(y);
+        if let Some(line) = self.lines_mut().get_mut(physical) {
+            line.wide_wrap = true;
+        }
+    }
+
     /// Moves the cursor down one line, scrolling at the bottom margin.
     fn index(&mut self) {
         if self.cursor.y == self.scroll_bottom {
@@ -2142,6 +2409,8 @@ impl Terminal {
                 ..Cell::blank()
             };
         }
+        line.wrapped = false;
+        line.wide_wrap = false;
         line.mark_all_written();
         self.mark_row(y);
     }
@@ -2161,6 +2430,8 @@ impl Terminal {
                 ..Cell::blank()
             };
         }
+        line.wrapped = false;
+        line.wide_wrap = false;
         line.mark_all_written();
         self.mark_row(y);
     }
@@ -2194,6 +2465,8 @@ impl Terminal {
                 ..Cell::blank()
             };
         }
+        line.wrapped = false;
+        line.wide_wrap = false;
         line.mark_all_written();
         self.mark_row(y);
     }
@@ -2425,6 +2698,7 @@ impl Terminal {
 fn blank_in_place(line: &mut Line, id: u64) {
     line.clear_written();
     line.wrapped = false;
+    line.wide_wrap = false;
     line.id = id;
 }
 
@@ -2435,6 +2709,36 @@ fn resize_line(line: &mut Line, cols: usize) {
         line.cells.push(Cell::blank());
     }
     line.mark_all_written();
+}
+
+/// Splits joined row content into `cols` wide rows without cutting a double
+/// width character in half: when one straddles the boundary it moves to the
+/// next row and the row it left is padded, as the print path does at the
+/// margin. Empty content is one empty row, so a blank line stays a line.
+fn split(content: &[Cell], cols: usize, rows: &mut Vec<(usize, usize)>) {
+    rows.clear();
+    let mut at = 0;
+    while at < content.len() {
+        let mut take = (content.len() - at).min(cols);
+        if at + take < content.len() && content[at + take - 1].width == 2 && take > 1 {
+            take -= 1;
+        }
+        rows.push((at, at + take));
+        at += take;
+    }
+    if rows.is_empty() {
+        rows.push((0, 0));
+    }
+}
+
+/// Length of a row up to its last styled or non-blank cell. The blanks that
+/// follow are padding an autowrap added to fill the row, and a rewrap drops
+/// them instead of turning them into text.
+fn content_len(cells: &[Cell]) -> usize {
+    cells
+        .iter()
+        .rposition(|cell| !cell.is_padding())
+        .map_or(0, |index| index + 1)
 }
 
 fn ordered(a: Anchor, b: Anchor) -> (Anchor, Anchor) {
@@ -2554,6 +2858,48 @@ mod tests {
     fn feed(terminal: &mut Terminal, bytes: &[u8]) {
         let mut parser = Parser::new();
         parser.advance(bytes, terminal);
+    }
+
+    /// Every row of history and screen, with the padding cells removed.
+    fn all_text(terminal: &Terminal) -> String {
+        let mut text = String::new();
+        for line in terminal.all_lines() {
+            let end = if line.wrapped {
+                line.cells.len()
+            } else {
+                content_len(&line.cells)
+            };
+            for cell in &line.cells[..end] {
+                if cell.width != 0 {
+                    text.push(cell.ch);
+                }
+            }
+        }
+        text
+    }
+
+    /// The visible text as logical lines, joining rows an autowrap continued.
+    fn reflow_text(terminal: &Terminal) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        for row in 0..terminal.rows {
+            let line = &terminal.lines()[row];
+            let end = if line.wrapped {
+                line.cells.len()
+            } else {
+                content_len(&line.cells)
+            };
+            for cell in &line.cells[..end] {
+                if cell.width != 0 {
+                    current.push(cell.ch);
+                }
+            }
+            if !line.wrapped {
+                lines.push(std::mem::take(&mut current));
+            }
+        }
+        lines.retain(|line| !line.is_empty());
+        lines
     }
 
     #[test]
@@ -3046,6 +3392,357 @@ mod tests {
             .mouse_report(0, 5, 2, false, false, MouseMods::default())
             .unwrap();
         assert_eq!(release, b"\x1b[<0;6;3m");
+    }
+
+    #[test]
+    fn resize_rewraps_a_paragraph_and_restores_it() {
+        let mut terminal = terminal(8);
+        let text = "the quick brown fox jumps over the lazy dog";
+        feed(&mut terminal, text.as_bytes());
+        assert_eq!(reflow_text(&terminal), vec![text]);
+        assert_eq!(terminal.cursor.y, 2);
+
+        terminal.resize(10, 8, 9, 18);
+        assert_eq!(reflow_text(&terminal), vec![text]);
+        assert_eq!(terminal.cursor.y, 4);
+        for (row, chunk) in [
+            "the quick ",
+            "brown fox ",
+            "jumps over",
+            " the lazy ",
+            "dog",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let line = &terminal.lines()[row];
+            assert!(line.wrapped || row == 4);
+            let end = if line.wrapped { line.cells.len() } else { 3 };
+            let got: String = line.cells[..end].iter().map(|cell| cell.ch).collect();
+            assert_eq!(&got, chunk, "row {row}");
+        }
+
+        terminal.resize(20, 8, 9, 18);
+        assert_eq!(reflow_text(&terminal), vec![text]);
+        assert_eq!(terminal.cursor.y, 2);
+        terminal.resize(50, 8, 9, 18);
+        assert_eq!(reflow_text(&terminal), vec![text]);
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), (43, 0));
+    }
+
+    #[test]
+    fn resize_keeps_rows_separated_by_a_newline() {
+        let mut terminal = terminal(3);
+        feed(&mut terminal, b"one line\r\ntwo line\r\nthree line");
+        terminal.resize(10, 3, 9, 18);
+        assert_eq!(
+            reflow_text(&terminal),
+            vec!["one line", "two line", "three line"]
+        );
+        for row in 3..terminal.rows {
+            assert!(!terminal.lines()[row].wrapped);
+        }
+    }
+
+    #[test]
+    fn resize_moves_the_cursor_with_its_text() {
+        let mut terminal = terminal(4);
+        feed(
+            &mut terminal,
+            b"the quick brown fox jumps over the lazy dog",
+        );
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), (3, 2));
+        terminal.resize(10, 4, 9, 18);
+        // Five rows of text in four rows of screen: the first scrolls away and
+        // the cursor ends just past "dog".
+        assert_eq!(terminal.scrollback_len(), 1);
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), (3, 3));
+        assert_eq!(terminal.visible_line(3).unwrap().cells[2].ch, 'g');
+        terminal.resize(30, 4, 9, 18);
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), (13, 1));
+    }
+
+    #[test]
+    fn resize_moves_rows_that_no_longer_fit_into_scrollback() {
+        let mut terminal = terminal(3);
+        feed(
+            &mut terminal,
+            b"aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii",
+        );
+        let text = reflow_text(&terminal).concat();
+        terminal.resize(10, 3, 9, 18);
+        assert!(terminal.scrollback_len() > 0);
+        assert_eq!(all_text(&terminal), text);
+        terminal.resize(40, 3, 9, 18);
+        assert_eq!(all_text(&terminal), text);
+    }
+
+    #[test]
+    fn resize_shrinking_the_height_keeps_the_bottom_row() {
+        let mut terminal = terminal(4);
+        feed(&mut terminal, b"one\r\ntwo\r\nthree\r\nfour");
+        terminal.resize(20, 2, 9, 18);
+        assert_eq!(terminal.visible_line(1).unwrap().cells[0].ch, 'f');
+        assert_eq!(terminal.visible_line(0).unwrap().cells[0].ch, 't');
+        assert_eq!(terminal.cursor.y, 1);
+        terminal.resize(20, 4, 9, 18);
+        assert_eq!(terminal.visible_line(3).unwrap().cells[0].ch, 'f');
+        assert_eq!(terminal.visible_line(2).unwrap().cells[0].ch, 't');
+        assert_eq!(terminal.cursor.y, 3);
+    }
+
+    #[test]
+    fn resize_keeps_styled_trailing_blanks() {
+        let mut terminal = terminal(3);
+        feed(&mut terminal, b"\x1b[44m      \x1b[0m");
+        terminal.resize(10, 3, 9, 18);
+        let end = content_len(&terminal.lines()[0].cells);
+        assert_eq!(end, 6);
+        assert_eq!(terminal.lines()[0].cells[5].bg, Color::Indexed(4));
+    }
+
+    #[test]
+    fn resize_does_not_reflow_the_alternate_screen() {
+        let mut terminal = terminal(4);
+        feed(&mut terminal, b"hello\x1b[?1049hALT");
+        terminal.resize(10, 4, 9, 18);
+        assert_eq!(terminal.visible_line(0).unwrap().cells[0].ch, 'A');
+        feed(&mut terminal, b"\x1b[?1049l");
+        assert_eq!(terminal.visible_line(0).unwrap().cells[0].ch, 'h');
+    }
+
+    #[test]
+    fn reflow_produces_the_same_rows_whether_print_ran_fast_or_slow() {
+        // The fast paths set and clear `wrapped` without touching cells, so a
+        // reflow must land on exactly the same rows as the per-character path.
+        let text = "the quick brown fox jumps over the lazy dog \
+            and then keeps going for a couple more lines of text";
+        let mut slow = terminal(6);
+        let mut fast = terminal(6);
+        for ch in text.chars() {
+            slow.print(ch);
+        }
+        fast.print_text_run(text);
+        for width in [7usize, 13, 20, 40] {
+            slow.resize(width, 6, 9, 18);
+            fast.resize(width, 6, 9, 18);
+            assert_eq!(all_text(&slow), all_text(&fast), "width {width}");
+        }
+    }
+
+    #[test]
+    fn resize_wraps_a_row_that_did_not_wrap_before() {
+        let mut terminal = terminal(2);
+        feed(&mut terminal, b"one\r\ntwo lines that need to wrap now");
+        terminal.resize(12, 4, 9, 18);
+        assert_eq!(
+            reflow_text(&terminal),
+            vec!["one", "two lines that need to wrap now"]
+        );
+        assert_eq!(terminal.scrollback_len(), 0);
+        let rows: Vec<(bool, String)> = (0..4)
+            .map(|row| {
+                let line = &terminal.lines()[row];
+                let end = if line.wrapped { 12 } else { 7 };
+                let text: String = line.cells[..end].iter().map(|cell| cell.ch).collect();
+                (line.wrapped, text)
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (false, "one    ".to_string()),
+                (true, "two lines th".to_string()),
+                (true, "at need to w".to_string()),
+                (false, "rap now".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_growing_the_height_restores_scrolled_rows() {
+        let mut terminal = terminal(3);
+        feed(&mut terminal, b"a\r\nb\r\nc\r\nd\r\ne");
+        assert_eq!(terminal.scrollback_len(), 2);
+        terminal.resize(20, 5, 9, 18);
+        assert_eq!(all_text(&terminal), "abcde");
+        assert_eq!(terminal.scrollback_len(), 0);
+        assert_eq!(terminal.cursor.y, 4);
+    }
+
+    #[test]
+    fn resize_reflows_rows_already_in_scrollback() {
+        let mut terminal = terminal(3);
+        let text = "one two three four five six seven eight nine ten";
+        feed(&mut terminal, text.as_bytes());
+        terminal.resize(40, 3, 9, 18);
+        assert_eq!(terminal.scrollback_len(), 0);
+        terminal.resize(10, 3, 9, 18);
+        assert_eq!(all_text(&terminal), text);
+        terminal.resize(40, 3, 9, 18);
+        assert_eq!(all_text(&terminal), text);
+    }
+
+    #[test]
+    fn resize_does_not_split_a_wide_character() {
+        // A width two cell that cannot fit stays whole: it moves to the next
+        // row, and the row it left is padded, as when printing at the margin.
+        let mut terminal = terminal(5);
+        feed(&mut terminal, "a\u{4e16}b\u{4e16}".as_bytes());
+        for cols in [2usize, 3, 7] {
+            terminal.resize(cols, 5, 9, 18);
+            let mut text = String::new();
+            for row in 0..5 {
+                let line = &terminal.lines()[row];
+                for col in 0..line.cells.len() {
+                    if line.cells[col].width == 2 {
+                        assert!(col + 1 < line.cells.len(), "cols {cols} row {row}");
+                        assert_eq!(line.cells[col + 1].width, 0, "cols {cols} row {row}");
+                    }
+                }
+                let end = if line.wrapped {
+                    line.cells.len()
+                } else {
+                    content_len(&line.cells)
+                };
+                text.extend(line.cells[..end].iter().map(|cell| cell.ch));
+            }
+            assert_eq!(text.matches('\u{4e16}').count(), 2, "cols {cols}");
+            assert!(text.contains('a') && text.contains('b'), "cols {cols}");
+        }
+    }
+
+    #[test]
+    fn reflow_keeps_every_row_within_the_width() {
+        let mut terminal = terminal(4);
+        let mut parser = Parser::new();
+        let mut seed = 1234u32;
+        for _ in 0..400 {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            let cols = 4 + (seed >> 16) as usize % 30;
+            let rows = 2 + (seed >> 8) as usize % 6;
+            terminal.resize(cols, rows, 9, 18);
+            parser.advance(
+                b"some text that wraps around a narrow window\r\n",
+                &mut terminal,
+            );
+            for line in terminal.scrollback.iter().chain(terminal.lines().iter()) {
+                assert_eq!(line.cells.len(), cols, "cols {cols}");
+                for (col, cell) in line.cells.iter().enumerate() {
+                    if cell.width == 2 {
+                        assert!(col + 1 < line.cells.len(), "wide char split");
+                        assert_eq!(line.cells[col + 1].width, 0);
+                    }
+                }
+            }
+            assert!(terminal.cursor.x < cols && terminal.cursor.y < rows);
+        }
+    }
+
+    #[test]
+    fn resize_while_in_alternate_reflows_the_primary_behind_it() {
+        let mut terminal = terminal(4);
+        let text = "some text long enough to wrap when the window narrows";
+        feed(&mut terminal, text.as_bytes());
+        feed(&mut terminal, b"\x1b[?1049hfull screen");
+        terminal.resize(10, 4, 9, 18);
+        assert_eq!(terminal.visible_line(0).unwrap().cells[0].ch, 'f');
+        feed(&mut terminal, b"\x1b[?1049l");
+        assert_eq!(all_text(&terminal), text);
+    }
+
+    #[test]
+    fn a_run_that_ends_on_the_margin_is_still_continued() {
+        // The print path sets wrap_pending at the margin, so the row is full and
+        // the next one continues it, whether or not text follows in the run.
+        let mut terminal = Terminal::new(
+            4,
+            3,
+            10,
+            Theme::from_config(&crate::config::ColorsConfig::default()).unwrap(),
+            CursorStyle::Block,
+            false,
+        );
+        terminal.print_ascii_run(b"abcd");
+        assert!(terminal.wrap_pending);
+        assert!(!terminal.lines()[0].wrapped);
+        terminal.print_ascii_run(b"e");
+        assert!(terminal.lines()[0].wrapped);
+        assert_eq!(terminal.lines()[1].cells[0].ch, 'e');
+        terminal.resize(2, 3, 9, 18);
+        assert_eq!(all_text(&terminal), "abcde");
+    }
+
+    #[test]
+    fn resize_a_full_row_keeps_the_next_character_on_a_new_row() {
+        // A row that filled the old width ends with a wrap pending. After a
+        // reflow the text still reaches the margin, so the next character must
+        // open a row instead of overwriting the last one.
+        let mut terminal = Terminal::new(
+            20,
+            3,
+            10,
+            Theme::from_config(&crate::config::ColorsConfig::default()).unwrap(),
+            CursorStyle::Block,
+            false,
+        );
+        terminal.print_ascii_run(b"aaaaaaaaaaaaaaaaaaaa");
+        terminal.resize(10, 3, 9, 18);
+        assert!(terminal.wrap_pending);
+        terminal.print('b');
+        assert_eq!(all_text(&terminal), "aaaaaaaaaaaaaaaaaaaab");
+        assert_eq!(terminal.cursor.y, 2);
+    }
+
+    #[test]
+    fn resize_in_the_alternate_screen_remaps_the_saved_cursor() {
+        // The primary rows reflow while the alternate screen is up, so the
+        // cursor saved for the return has to move with its text too.
+        let text = "some text long enough to wrap when the window narrows";
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let mut direct = Terminal::new(4, 4, 10, theme.clone(), CursorStyle::Block, false);
+        let mut round_trip = Terminal::new(4, 4, 10, theme, CursorStyle::Block, false);
+        for terminal in [&mut direct, &mut round_trip] {
+            feed(terminal, text.as_bytes());
+        }
+        direct.resize(20, 4, 9, 18);
+        feed(&mut round_trip, b"\x1b[?1049hx");
+        round_trip.resize(20, 4, 9, 18);
+        feed(&mut round_trip, b"\x1b[?1049l");
+        assert_eq!(
+            (direct.cursor.x, direct.cursor.y),
+            (round_trip.cursor.x, round_trip.cursor.y)
+        );
+        assert_eq!(
+            direct.visible_line(direct.cursor.y).unwrap().cells[0].ch,
+            round_trip.visible_line(round_trip.cursor.y).unwrap().cells[0].ch
+        );
+    }
+
+    #[test]
+    fn a_widened_row_does_not_turn_wrap_padding_into_text() {
+        // A double width character that did not fit left the margin blank. A
+        // reflow moves that padding away instead of copying it as a space.
+        let mut terminal = Terminal::new(
+            2,
+            5,
+            10,
+            Theme::from_config(&crate::config::ColorsConfig::default()).unwrap(),
+            CursorStyle::Block,
+            false,
+        );
+        let text = "a\u{4e16}b\u{4e16}";
+        feed(&mut terminal, text.as_bytes());
+        terminal.select_all();
+        assert_eq!(
+            terminal.selection_text().as_deref(),
+            Some("a\u{4e16}b\u{4e16}\n ")
+        );
+        terminal.resize(10, 5, 9, 18);
+        terminal.select_all();
+        let copied = terminal.selection_text().unwrap();
+        assert!(copied.starts_with(text), "{copied:?}");
+        assert!(!copied.contains("a \u{4e16}"), "{copied:?}");
     }
 
     #[test]

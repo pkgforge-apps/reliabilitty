@@ -49,6 +49,8 @@ This is an early release. The following are implemented and exercised:
 - True per-pixel background transparency through a 32-bit ARGB visual, with
   whole-window compositor opacity as a fallback.
 - A draggable scrollbar for scrollback.
+- Automatic reflow: rows an autowrap continued are joined, unwrapped and split
+  again at the new width, in the scrollback too.
 - Static musl builds for x86_64 and aarch64, well below 3 MiB.
 
 ## Build
@@ -199,7 +201,9 @@ The current release intentionally keeps a narrow scope:
 
 - X11 only. No Wayland, Windows or macOS.
 - No XIM/IME support yet; dead keys are composed internally for Latin layouts.
-- No automatic reflow of wrapped lines when the window is resized.
+- Wrapped lines reflow when the window is resized, in the scrollback too. The
+  alternate screen is left alone for the application that draws on it, and a
+  rewrap drops the current selection because its anchors are column based.
 - No ligatures, font feature configuration or image protocols.
 - Selection requests using X11 `INCR` transfers are refused rather than pasted
   partially. Large clipboard transfers may therefore be unavailable.
