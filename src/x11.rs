@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::properties::WmSizeHints;
 use x11rb::protocol::Event;
+use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
@@ -633,6 +634,63 @@ impl X11 {
 
     pub fn height(&self) -> u16 {
         self.height
+    }
+
+    /// Duration of one display frame, from the active RandR mode's dot clock.
+    /// Falls back to 16 ms when RandR is unavailable or reports no usable mode.
+    pub fn frame_interval(&self) -> std::time::Duration {
+        const FALLBACK: std::time::Duration = std::time::Duration::from_millis(16);
+        let resources = match self
+            .connection
+            .randr_get_screen_resources_current(self.root)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        {
+            Some(reply) => reply,
+            None => return FALLBACK,
+        };
+        let mut active: Vec<_> = resources
+            .crtcs
+            .iter()
+            .filter_map(|crtc| {
+                self.connection
+                    .randr_get_crtc_info(*crtc, resources.config_timestamp)
+                    .ok()
+                    .and_then(|cookie| cookie.reply().ok())
+            })
+            .filter(|info| info.width > 0 && info.height > 0)
+            .collect();
+        let origin = self
+            .connection
+            .translate_coordinates(self.window, self.root, 0, 0)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok());
+        if let Some(origin) = origin {
+            let x = origin.dst_x as i32 + self.width as i32 / 2;
+            let y = origin.dst_y as i32 + self.height as i32 / 2;
+            active.sort_by_key(|info| {
+                let inside = x >= info.x as i32
+                    && x < info.x as i32 + info.width as i32
+                    && y >= info.y as i32
+                    && y < info.y as i32 + info.height as i32;
+                std::cmp::Reverse(inside)
+            });
+        }
+        for info in active {
+            if let Some(mode) = resources.modes.iter().find(|mode| mode.id == info.mode) {
+                let total = mode.htotal as u64 * mode.vtotal as u64;
+                if total > 0 && mode.dot_clock > 0 {
+                    let micros = total * 1_000_000 / mode.dot_clock as u64;
+                    let interval = std::time::Duration::from_micros(micros);
+                    if interval >= std::time::Duration::from_millis(1)
+                        && interval <= std::time::Duration::from_millis(100)
+                    {
+                        return interval;
+                    }
+                }
+            }
+        }
+        FALLBACK
     }
 
     pub fn time(&self) -> u32 {

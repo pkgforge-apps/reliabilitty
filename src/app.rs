@@ -119,6 +119,7 @@ struct App {
     bell_until: Option<Instant>,
     redraw_all: bool,
     next_frame: Instant,
+    frame_interval: Duration,
     last_pty_input: Instant,
     smoke: bool,
     rendered_once: bool,
@@ -322,6 +323,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
     });
     let bindings = Bindings::new(&config.keyboard)?;
     let now = Instant::now();
+    let frame_interval = x11.frame_interval();
     let mut app = App {
         config,
         config_path,
@@ -360,6 +362,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         bell_until: None,
         redraw_all: true,
         next_frame: now,
+        frame_interval,
         last_pty_input: now,
         smoke: cli.smoke,
         rendered_once: false,
@@ -419,7 +422,7 @@ impl App {
             if idle || now >= self.next_frame {
                 self.cursor_damage();
                 self.render(now);
-                self.next_frame = now + Duration::from_millis(8);
+                self.next_frame = now + self.frame_interval;
             }
             if self.quit {
                 self.reader_stop.store(true, Ordering::Relaxed);
