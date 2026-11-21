@@ -120,6 +120,7 @@ struct App {
     redraw_all: bool,
     next_frame: Instant,
     frame_interval: Duration,
+    resize_settle_at: Option<Instant>,
     last_pty_input: Instant,
     smoke: bool,
     rendered_once: bool,
@@ -363,6 +364,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         redraw_all: true,
         next_frame: now,
         frame_interval,
+        resize_settle_at: None,
         last_pty_input: now,
         smoke: cli.smoke,
         rendered_once: false,
@@ -450,6 +452,13 @@ impl App {
         }
         if self.drag.is_some() && now >= self.auto_scroll_at {
             self.autoscroll(now);
+        }
+        if self
+            .resize_settle_at
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.resize_settle_at = None;
+            self.terminal.finish_deferred_resize();
         }
     }
 
@@ -1368,6 +1377,8 @@ impl App {
             self.terminal.set_window_pixels(width, height);
             self.pty.resize(cols, rows, width as usize, height as usize);
             self.terminal.mark_all();
+            // Reflowing scrollback is deferred until the drag settles.
+            self.resize_settle_at = Some(Instant::now() + Duration::from_millis(100));
         } else {
             self.terminal.cell_width = self.cell_width;
             self.terminal.cell_height = self.cell_height;
@@ -1590,6 +1601,9 @@ impl App {
         }
         if self.drag.is_some() {
             deadline(self.auto_scroll_at);
+        }
+        if let Some(settle) = self.resize_settle_at {
+            deadline(settle);
         }
         if let Some(until) = self.bell_until {
             deadline(until);

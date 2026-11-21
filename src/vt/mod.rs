@@ -379,6 +379,8 @@ pub struct Terminal {
     line_id_next: u64,
     extras: Vec<Box<str>>,
     extras_map: HashMap<Box<str>, u32>,
+    /// Scrollback lines need reflowing after a width change.
+    pending_scrollback_resize: bool,
     /// OSC 8 hyperlink targets, one-based so zero in a Cell means no link.
     link_targets: Vec<Box<str>>,
     active_link: u32,
@@ -460,6 +462,7 @@ impl Terminal {
             line_id_next: 0,
             extras: Vec::new(),
             extras_map: HashMap::new(),
+            pending_scrollback_resize: false,
             link_targets: Vec::new(),
             active_link: 0,
             last_printed: None,
@@ -495,6 +498,11 @@ impl Terminal {
 
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
+    }
+
+    #[cfg(test)]
+    pub fn scrollback_cells_len(&self, index: usize) -> usize {
+        self.scrollback[index].cells.len()
     }
 
     pub fn scroll_offset(&self) -> usize {
@@ -1320,6 +1328,7 @@ impl Terminal {
             return;
         }
         self.normalize_region();
+        let cols_changed = self.cols != cols;
         self.cols = cols;
         self.rows = rows;
         for line in &mut self.main {
@@ -1330,8 +1339,11 @@ impl Terminal {
                 resize_line(line, cols);
             }
         }
-        for line in &mut self.scrollback {
-            resize_line(line, cols);
+        // Reflowing every scrollback line is O(history) and can take several
+        // milliseconds. Defer it until the resize settles so interactive drags
+        // stay responsive; visible lines are resized immediately above.
+        if cols_changed {
+            self.pending_scrollback_resize = true;
         }
         while self.main.len() < rows {
             let line = self.new_line();
@@ -1361,6 +1373,19 @@ impl Terminal {
         self.dirty_all = true;
         self.last_printed = None;
         self.wrap_pending = false;
+    }
+
+    /// Reflows scrollback lines after a width change. Called once the resize
+    /// settles so interactive drags do not pay this cost on every event.
+    pub fn finish_deferred_resize(&mut self) {
+        if !self.pending_scrollback_resize {
+            return;
+        }
+        self.pending_scrollback_resize = false;
+        let cols = self.cols;
+        for line in &mut self.scrollback {
+            resize_line(line, cols);
+        }
     }
 
     pub fn set_window_pixels(&mut self, width: u16, height: u16) {
@@ -2783,6 +2808,21 @@ mod tests {
         assert_eq!(terminal.cursor.x, 1);
         assert_eq!(terminal.cursor.y, 1);
         assert_eq!(terminal.lines()[1].cells[1].ch, ' ');
+    }
+
+    #[test]
+    fn deferred_scrollback_resize() {
+        let mut terminal = terminal(2);
+        feed(&mut terminal, b"a\r\nb\r\nc");
+        assert_eq!(terminal.scrollback_len(), 1);
+        assert_eq!(terminal.scrollback_cells_len(0), 20);
+
+        terminal.resize(40, 2, 10, 20);
+        assert_eq!(terminal.width(), 40);
+        assert_eq!(terminal.scrollback_cells_len(0), 20);
+
+        terminal.finish_deferred_resize();
+        assert_eq!(terminal.scrollback_cells_len(0), 40);
     }
 
     #[test]
