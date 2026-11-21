@@ -59,6 +59,7 @@ pub struct Pen {
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attrs,
+    pub link: u32,
 }
 
 impl Default for Pen {
@@ -67,6 +68,7 @@ impl Default for Pen {
             fg: Color::Default,
             bg: Color::Default,
             attrs: Attrs::default(),
+            link: 0,
         }
     }
 }
@@ -80,6 +82,8 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attrs,
+    /// One-based index into the terminal's OSC 8 link targets; zero is none.
+    pub link: u32,
     /// Display width: zero for a continuation, one or two for a base.
     pub width: u8,
 }
@@ -92,6 +96,7 @@ impl Cell {
             fg: Color::Default,
             bg: Color::Default,
             attrs: Attrs::default(),
+            link: 0,
             width: 1,
         }
     }
@@ -374,6 +379,9 @@ pub struct Terminal {
     line_id_next: u64,
     extras: Vec<Box<str>>,
     extras_map: HashMap<Box<str>, u32>,
+    /// OSC 8 hyperlink targets, one-based so zero in a Cell means no link.
+    link_targets: Vec<Box<str>>,
+    active_link: u32,
     last_printed: Option<(usize, usize)>,
     wrap_pending: bool,
     last_graphic: char,
@@ -452,6 +460,8 @@ impl Terminal {
             line_id_next: 0,
             extras: Vec::new(),
             extras_map: HashMap::new(),
+            link_targets: Vec::new(),
+            active_link: 0,
             last_printed: None,
             wrap_pending: false,
             last_graphic: ' ',
@@ -667,6 +677,51 @@ impl Terminal {
 
     pub fn extra_text(&self, id: u32) -> Option<&str> {
         self.extras.get(id as usize - 1).map(|text| &**text)
+    }
+
+    /// Starts an OSC 8 hyperlink, reusing an existing target id if the URI is
+    /// identical. Returns the one-based id stored in cells.
+    pub fn set_link(&mut self, target: &str) -> u32 {
+        if let Some(index) = self
+            .link_targets
+            .iter()
+            .position(|existing| &**existing == target)
+        {
+            self.active_link = index as u32 + 1;
+        } else {
+            self.link_targets.push(target.into());
+            self.active_link = self.link_targets.len() as u32;
+        }
+        self.pen.link = self.active_link;
+        self.active_link
+    }
+
+    /// Ends the active OSC 8 hyperlink.
+    pub fn clear_link(&mut self) {
+        self.active_link = 0;
+        self.pen.link = 0;
+    }
+
+    /// Resolves the OSC 8 target id of the cell at a visible row and column.
+    /// Continuation cells of wide characters inherit the base cell's link by
+    /// walking back to it.
+    pub fn link_at(&self, row: usize, col: usize) -> Option<&str> {
+        let line = self.visible_line(row)?;
+        let mut col = col.min(line.cells.len().saturating_sub(1));
+        while col > 0 && line.cells.get(col).is_some_and(|cell| cell.width == 0) {
+            col -= 1;
+        }
+        let id = line.cells.get(col)?.link;
+        self.link_target(id)
+    }
+
+    fn link_target(&self, id: u32) -> Option<&str> {
+        if id == 0 {
+            return None;
+        }
+        self.link_targets
+            .get(id as usize - 1)
+            .map(|target| &**target)
     }
 
     pub fn has_selection(&self) -> bool {
@@ -1403,7 +1458,7 @@ impl Terminal {
         {
             let y = self.cursor.y;
             let x = self.cursor.x;
-            let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
+            let (fg, bg, attrs, link) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
             let line = self.line_mut(y);
             if line.cells[x].width == 1 {
                 line.cells[x] = Cell {
@@ -1412,6 +1467,7 @@ impl Terminal {
                     fg,
                     bg,
                     attrs,
+                    link,
                     width: 1,
                 };
                 line.mark_written_range(x, x);
@@ -1451,13 +1507,14 @@ impl Terminal {
         let y = self.cursor.y;
         let x = self.cursor.x;
         let cols = self.cols;
-        let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
+        let (fg, bg, attrs, link) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
         let cell = Cell {
             ch,
             extra: 0,
             fg,
             bg,
             attrs,
+            link,
             width: width as u8,
         };
         let line = self.line_mut(y);
@@ -1524,7 +1581,7 @@ impl Terminal {
             return;
         }
         let cols = self.cols;
-        let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
+        let (fg, bg, attrs, link) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
         let (region_top, region_bottom, region_offset) =
             (self.scroll_top, self.scroll_bottom, self.region_offset);
         let map = |row: usize| -> usize {
@@ -1574,6 +1631,7 @@ impl Terminal {
                         fg,
                         bg,
                         attrs,
+                        link,
                         width: 1,
                     };
                     line.wrapped = false;
@@ -1647,6 +1705,7 @@ impl Terminal {
                         fg,
                         bg,
                         attrs,
+                        link,
                         width: 1,
                     };
                 }
@@ -1691,7 +1750,7 @@ impl Terminal {
             }
             let y = self.cursor.y;
             let start = self.cursor.x;
-            let (fg, bg, attrs) = (self.pen.fg, self.pen.bg, self.pen.attrs);
+            let (fg, bg, attrs, link) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
             let mut x = start;
             let mut last = None;
             let mut last_x = start;
@@ -1716,6 +1775,7 @@ impl Terminal {
                         fg,
                         bg,
                         attrs,
+                        link,
                         width: width as u8,
                     };
                     line.cells[x] = cell;
@@ -2300,6 +2360,7 @@ impl Terminal {
         self.cursor.style = self.default_cursor_style;
         self.cursor.blinking = self.default_cursor_blink;
         self.pen = Pen::default();
+        self.active_link = 0;
         self.saved = None;
         self.alt_saved = None;
         self.scroll_top = 0;
@@ -2337,6 +2398,7 @@ impl Terminal {
     fn soft_reset(&mut self) {
         self.cursor.visible = true;
         self.pen = Pen::default();
+        self.active_link = 0;
         self.normalize_region();
         self.region_offset = 0;
         self.scroll_top = 0;
@@ -2632,6 +2694,7 @@ mod tests {
                         fg: Color::Default,
                         bg: Color::Default,
                         attrs: Attrs::default(),
+                        link: 0,
                         width: 2,
                     };
                     t.lines_mut()[0].cells[4] = Cell {
@@ -2640,6 +2703,7 @@ mod tests {
                         fg: Color::Default,
                         bg: Color::Default,
                         attrs: Attrs::default(),
+                        link: 0,
                         width: 0,
                     };
                 }
@@ -2904,6 +2968,54 @@ mod tests {
         feed(&mut terminal, b"one\x1b[?1049hALT\x1b[?1049l");
         assert_eq!(terminal.lines()[0].cells[0].ch, 'o');
         assert!(!terminal.in_alt());
+    }
+
+    #[test]
+    fn osc8_link_is_stored_and_cleared() {
+        let mut terminal = terminal(2);
+        feed(
+            &mut terminal,
+            b"\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\ end",
+        );
+        assert_eq!(terminal.link_at(0, 0), Some("https://example.com"));
+        assert_eq!(terminal.link_at(0, 4), Some("https://example.com"));
+        assert_eq!(terminal.link_at(0, 6), None);
+    }
+
+    #[test]
+    fn osc8_link_bel_terminator() {
+        let mut terminal = terminal(2);
+        feed(
+            &mut terminal,
+            b"\x1b]8;;file:///tmp/x.rs\x07link\x1b]8;;\x07",
+        );
+        assert_eq!(terminal.link_at(0, 0), Some("file:///tmp/x.rs"));
+        assert_eq!(terminal.link_at(0, 4), None);
+    }
+
+    #[test]
+    fn osc8_link_survives_scroll() {
+        let mut terminal = terminal(2);
+        feed(
+            &mut terminal,
+            b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\r\n",
+        );
+        feed(&mut terminal, b"after\r\nmore\r\nlast");
+        assert_eq!(terminal.scrollback_len(), 2);
+        assert_eq!(terminal.link_at(0, 0), None);
+        terminal.scroll(-2);
+        assert_eq!(terminal.link_at(0, 0), Some("https://example.com"));
+    }
+
+    #[test]
+    fn osc8_link_dedups_targets() {
+        let mut terminal = terminal(2);
+        feed(
+            &mut terminal,
+            b"\x1b]8;;https://example.com\x1b\\a\x1b]8;;\x1b\\\x1b]8;;https://example.com\x1b\\b",
+        );
+        assert_eq!(terminal.link_targets.len(), 1);
+        assert_eq!(terminal.link_at(0, 0), terminal.link_at(0, 1));
     }
 
     #[test]

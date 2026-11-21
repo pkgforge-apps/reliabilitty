@@ -43,6 +43,7 @@ This is an early release. The following are implemented and exercised:
 - Scrollback search with case-insensitive highlighting, Ctrl+Shift+F and
   Enter to step through matches.
 - OSC titles, palette changes, default colour changes and terminal responses.
+- OSC 8 hyperlinks, underlined and opened with Ctrl+click via `xdg-open`.
 - Shell-style configuration with live reload and environment overrides.
 - Software rendering through SHM with a `PutImage` fallback.
 - True per-pixel background transparency through a 32-bit ARGB visual, with
@@ -154,6 +155,7 @@ See [`rtty.example.conf`](rtty.example.conf) for every option.
 | `F11` | Toggle fullscreen |
 | `Ctrl+Shift+Alt+C` | Open another window |
 | `Shift` + click | Select even when the application requested mouse input |
+| `Ctrl` + click | Open an OSC 8 hyperlink with `xdg-open` |
 | Middle click | Paste PRIMARY |
 | Double click / triple click | Select word / line |
 

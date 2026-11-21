@@ -49,6 +49,7 @@ impl Terminal {
                                 fg,
                                 bg,
                                 attrs,
+                                link: 0,
                                 width: 1,
                             };
                         }
@@ -236,6 +237,22 @@ impl Terminal {
                 }
             }
             b"4" => self.osc_palette(rest),
+            b"8" => {
+                let target = rest
+                    .iter()
+                    .position(|byte| *byte == b';')
+                    .map_or(&[][..], |index| &rest[index + 1..]);
+                if target.is_empty() {
+                    self.clear_link();
+                } else {
+                    let target = String::from_utf8_lossy(target);
+                    if target.chars().any(char::is_control) {
+                        self.clear_link();
+                    } else {
+                        self.set_link(&target);
+                    }
+                }
+            }
             b"10" => self.osc_default_color(rest, 0),
             b"11" => self.osc_default_color(rest, 1),
             b"12" => self.osc_default_color(rest, 2),

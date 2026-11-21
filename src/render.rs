@@ -475,6 +475,7 @@ impl Renderer {
                 // no attributes; redrawing them only repeats work.
                 if cell.ch == ' '
                     && cell.extra == 0
+                    && cell.link == 0
                     && cell.bg == Color::Default
                     && cell.attrs == Attrs::default()
                     && !has_selection
@@ -614,7 +615,7 @@ impl Renderer {
 
         let underline_y = y + (self.baseline + self.underline_offset).round() as i32;
         let stroke = self.stroke_size.round().max(1.0) as i32;
-        if attrs.contains(Attrs::UNDERLINE) {
+        if attrs.contains(Attrs::UNDERLINE) || cell.link != 0 {
             canvas.fill_rect(x, underline_y, width, stroke, foreground);
         }
         if attrs.contains(Attrs::DOUBLE_UNDERLINE) {

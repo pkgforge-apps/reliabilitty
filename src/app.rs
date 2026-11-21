@@ -712,6 +712,12 @@ impl App {
         }
     }
 
+    fn open_link(&self, uri: &str) {
+        if let Err(error) = Command::new("xdg-open").arg(uri).spawn() {
+            eprintln!("rtty: cannot open link: {error}");
+        }
+    }
+
     fn copy_selection(&mut self, clipboard: bool) {
         let Some(text) = self.terminal.selection_text() else {
             return;
@@ -907,6 +913,14 @@ impl App {
         };
         let shift =
             mods.shift || state & u16::from(x11rb::protocol::xproto::KeyButMask::SHIFT) != 0;
+        let control =
+            mods.control || state & u16::from(x11rb::protocol::xproto::KeyButMask::CONTROL) != 0;
+        if pressed && button == 1 && control {
+            if let Some(uri) = self.terminal.link_at(row, col) {
+                self.open_link(uri);
+                return;
+            }
+        }
         let mouse_mode = self.terminal.mouse_mode();
 
         if matches!(button, 4 | 5) {
