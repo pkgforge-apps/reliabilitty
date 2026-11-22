@@ -26,7 +26,7 @@ mimalloc = { version = "0.1.52", default-features = false, features = ["no_thp"]
 swash = "0.2.10"
 unicode-normalization = "0.1.26"
 unicode-width = "0.2.3"
-x11rb = { version = "0.14.0", default-features = false, features = ["shm", "xkb", "randr"] }
+x11rb = { version = "0.14.0", default-features = false, features = ["shm", "sync", "xkb", "randr"] }
 xkeysym = "0.2.1"
 
 [profile.release]

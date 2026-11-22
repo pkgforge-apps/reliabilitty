@@ -2,12 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::time::Instant;
 
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::properties::WmSizeHints;
 use x11rb::protocol::Event;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shm::{self, ConnectionExt as _};
+use x11rb::protocol::sync;
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     self, Atom, AtomEnum, ClientMessageEvent, ConnectionExt as _, EventMask, KeyButMask, PropMode,
@@ -60,6 +62,8 @@ pub enum UiEvent {
 struct Atoms {
     wm_protocols: Atom,
     wm_delete_window: Atom,
+    net_wm_sync_request: Atom,
+    net_wm_sync_request_counter: Atom,
     net_wm_name: Atom,
     net_wm_pid: Atom,
     net_wm_window_opacity: Atom,
@@ -110,10 +114,13 @@ struct ShmSegment {
     id: shm::Seg,
     address: *mut u8,
     length: usize,
+    /// Pixels per row. Stays fixed while the window is resized so the
+    /// compositor never sees the shared texture change layout underneath it.
+    stride: usize,
 }
 
 impl ShmSegment {
-    fn new(connection: &RustConnection, length: usize) -> Option<Self> {
+    fn new(connection: &RustConnection, length: usize, stride: usize) -> Option<Self> {
         let id = connection.generate_id().ok()?;
         let reply = connection
             .shm_create_segment(id, length as u32, false)
@@ -140,6 +147,7 @@ impl ShmSegment {
             id,
             address: address as *mut u8,
             length,
+            stride,
         })
     }
 
@@ -283,6 +291,19 @@ pub struct X11 {
     xkb: bool,
     shm: Option<ShmSegment>,
     shm_failed: bool,
+    shm_fresh: bool,
+    /// Basic and extended frame counters advertised through
+    /// `_NET_WM_SYNC_REQUEST_COUNTER`. Current mutter only watches the
+    /// extended one; the basic one keeps older window managers working.
+    sync_counters: Option<(sync::Counter, sync::Counter)>,
+    /// Serial of the last `_NET_WM_SYNC_REQUEST` still awaiting a drawn frame.
+    sync_serial: Option<sync::Int64>,
+    /// Arrival time of the last sync request, used to learn the compositor's
+    /// frame cadence. The WM emits one request per frame during a resize, so
+    /// this tracks VRR panels and XWayland where RandR reports a synthetic mode.
+    sync_last_at: Option<Instant>,
+    /// Smoothed interval between consecutive sync requests, if observed.
+    sync_interval: Option<std::time::Duration>,
     clipboard: Clipboard,
     last_time: u32,
     fullscreen: bool,
@@ -418,6 +439,35 @@ impl X11 {
             .create_gc(gc, window, &xproto::CreateGCAux::new())
             .map_err(|error| error.to_string())?;
 
+        let sync_counters = if connection
+            .extension_information(sync::X11_EXTENSION_NAME)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            let basic = connection
+                .generate_id()
+                .map_err(|error| error.to_string())?;
+            let extended = connection
+                .generate_id()
+                .map_err(|error| error.to_string())?;
+            let zero = sync::Int64 { hi: 0, lo: 0 };
+            sync::create_counter(&connection, basic, zero).map_err(|error| error.to_string())?;
+            sync::create_counter(&connection, extended, zero).map_err(|error| error.to_string())?;
+            connection
+                .change_property32(
+                    PropMode::REPLACE,
+                    window,
+                    atoms.net_wm_sync_request_counter,
+                    AtomEnum::CARDINAL,
+                    &[basic, extended],
+                )
+                .map_err(|error| error.to_string())?;
+            Some((basic, extended))
+        } else {
+            None
+        };
+
         connection
             .change_property8(
                 PropMode::REPLACE,
@@ -460,13 +510,17 @@ impl X11 {
                 &[pid],
             )
             .map_err(|error| error.to_string())?;
+        let mut protocols = vec![atoms.wm_delete_window];
+        if sync_counters.is_some() {
+            protocols.push(atoms.net_wm_sync_request);
+        }
         connection
             .change_property32(
                 PropMode::REPLACE,
                 window,
                 atoms.wm_protocols,
                 xproto::AtomEnum::ATOM,
-                &[atoms.wm_delete_window],
+                &protocols,
             )
             .map_err(|error| error.to_string())?;
         if !argb && window_config.opacity < 1.0 {
@@ -579,6 +633,11 @@ impl X11 {
             xkb,
             shm: None,
             shm_failed: !shm,
+            shm_fresh: false,
+            sync_counters,
+            sync_serial: None,
+            sync_last_at: None,
+            sync_interval: None,
             clipboard: Clipboard::default(),
             last_time: 0,
             fullscreen: window_config
@@ -815,45 +874,126 @@ impl X11 {
         if height == 0 || canvas.width == 0 {
             return;
         }
-        self.ensure_shm(canvas.width, canvas.height);
-        if !self.shm_failed {
-            if let Some(segment) = &mut self.shm {
-                let row_bytes = canvas.width as usize * 4;
-                let offset = first as usize * row_bytes;
-                let length = height as usize * row_bytes;
-                if offset + length <= segment.length {
-                    let start = first as usize * canvas.width as usize;
-                    let end = (first as usize + height as usize) * canvas.width as usize;
-                    let destination = &mut segment.bytes()[offset..offset + length];
-                    Self::write_pixels(self.pixel_format, &canvas.pixels[start..end], destination);
-                    if self
-                        .connection
-                        .shm_put_image(
-                            self.window,
-                            self.gc,
-                            canvas.width,
-                            canvas.height,
-                            0,
-                            first,
-                            canvas.width,
-                            height,
-                            0,
-                            first as i16,
-                            self.depth,
-                            xproto::ImageFormat::Z_PIXMAP.into(),
-                            false,
-                            segment.id,
-                            0,
-                        )
-                        .is_ok()
-                    {
-                        let _ = self.connection.flush();
-                        return;
-                    }
-                }
+        self.put_image(canvas, 0, first, canvas.width, height);
+    }
+
+    fn clip_rect(
+        canvas: &Canvas,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    ) -> (usize, usize, usize, usize) {
+        let cw = canvas.width as usize;
+        let x0 = (x as usize).min(cw);
+        let y0 = (y as usize).min(canvas.height as usize);
+        let w = (x0 + width as usize).min(cw) - x0;
+        let h = (y0 + height as usize).min(canvas.height as usize) - y0;
+        (x0, y0, w, h)
+    }
+
+    fn put_image(&mut self, canvas: &Canvas, x: u16, y: u16, width: u16, height: u16) {
+        let (x0, y0, w, h) = Self::clip_rect(canvas, x, y, width, height);
+        if w == 0 || h == 0 {
+            return;
+        }
+        if self.write_rect(canvas, x0, y0, w, h) && self.shm_copy(canvas, x0, y0, w, h) {
+            return;
+        }
+        self.present_slow(canvas, y0 as u16, h as u16);
+    }
+
+    /// Copies the requested rectangle from the canvas into the shared segment,
+    /// translating from the canvas stride to the segment stride.
+    fn write_rect(&mut self, canvas: &Canvas, x0: usize, y0: usize, w: usize, h: usize) -> bool {
+        self.ensure_shm(canvas.stride, canvas.height);
+        if self.shm_failed {
+            return false;
+        }
+        let fresh = self.shm_fresh;
+        self.shm_fresh = false;
+        let Some(segment) = &mut self.shm else {
+            return false;
+        };
+        // A freshly allocated segment has undefined contents, so populate the
+        // whole texture once instead of just the requested rectangle.
+        let (x0, y0, w, h) = if fresh {
+            (
+                0usize,
+                0usize,
+                canvas.width as usize,
+                canvas.height as usize,
+            )
+        } else {
+            (x0, y0, w, h)
+        };
+        let stride = segment.stride;
+        let row_bytes = stride * 4;
+        let buffer_stride = canvas.stride as usize;
+        if stride < canvas.width as usize || (y0 + h) * row_bytes > segment.length {
+            return false;
+        }
+        for row in 0..h {
+            let source = (y0 + row) * buffer_stride + x0;
+            let destination = (y0 + row) * row_bytes + x0 * 4;
+            if source + w > canvas.pixels.len() {
+                return false;
+            }
+            Self::write_pixels(
+                self.pixel_format,
+                &canvas.pixels[source..source + w],
+                &mut segment.bytes()[destination..destination + w * 4],
+            );
+        }
+        true
+    }
+
+    fn shm_copy(&self, canvas: &Canvas, x0: usize, y0: usize, w: usize, h: usize) -> bool {
+        let Some(segment) = &self.shm else {
+            return false;
+        };
+        let ok = self
+            .connection
+            .shm_put_image(
+                self.window,
+                self.gc,
+                segment.stride as u16,
+                canvas.height,
+                x0 as u16,
+                y0 as u16,
+                w as u16,
+                h as u16,
+                x0 as i16,
+                y0 as i16,
+                self.depth,
+                xproto::ImageFormat::Z_PIXMAP.into(),
+                false,
+                segment.id,
+                0,
+            )
+            .is_ok();
+        if ok {
+            let _ = self.connection.flush();
+        }
+        ok
+    }
+
+    /// Presents only the changed edge strips into the shared segment, then
+    /// re-uploads the whole window from it. A resize discards the window's X
+    /// pixmap, but the segment keeps every already drawn pixel because its row
+    /// stride is fixed, so no full CPU-side copy is needed.
+    pub fn present_rects(&mut self, canvas: &Canvas, rects: &[(u16, u16, u16, u16)]) {
+        let mut ok = true;
+        for &(x, y, width, height) in rects {
+            let (x0, y0, w, h) = Self::clip_rect(canvas, x, y, width, height);
+            if w > 0 && h > 0 {
+                ok &= self.write_rect(canvas, x0, y0, w, h);
             }
         }
-        self.present_slow(canvas, first, height);
+        if ok && self.shm_copy(canvas, 0, 0, canvas.width as usize, canvas.height as usize) {
+            return;
+        }
+        self.present_slow(canvas, 0, canvas.height);
     }
 
     fn write_pixels(format: PixelFormat, source: &[u32], destination: &mut [u8]) {
@@ -873,10 +1013,18 @@ impl X11 {
     }
 
     fn present_slow(&mut self, canvas: &Canvas, first: u16, height: u16) {
-        let start = first as usize * canvas.width as usize;
-        let end = (first as usize + height as usize) * canvas.width as usize;
-        let mut bytes = vec![0; (end - start) * 4];
-        Self::write_pixels(self.pixel_format, &canvas.pixels[start..end], &mut bytes);
+        let width = canvas.width as usize;
+        let stride = canvas.stride as usize;
+        let mut bytes = vec![0; width * height as usize * 4];
+        for row in 0..height as usize {
+            let source = (first as usize + row) * stride;
+            let destination = row * width * 4;
+            Self::write_pixels(
+                self.pixel_format,
+                &canvas.pixels[source..source + width],
+                &mut bytes[destination..destination + width * 4],
+            );
+        }
         let result = self.connection.put_image(
             xproto::ImageFormat::Z_PIXMAP,
             self.window,
@@ -895,11 +1043,11 @@ impl X11 {
     }
 
     fn ensure_shm(&mut self, width: u16, height: u16) {
-        let needed = width as usize * height as usize * 4;
-        if self
-            .shm
-            .as_ref()
-            .is_some_and(|segment| segment.length >= needed)
+        let width = width as usize;
+        let height = height as usize;
+        if let Some(segment) = &self.shm
+            && segment.stride >= width
+            && segment.length >= segment.stride.saturating_mul(height).saturating_mul(4)
         {
             return;
         }
@@ -907,8 +1055,20 @@ impl X11 {
         if self.shm_failed {
             return;
         }
-        match ShmSegment::new(&self.connection, needed) {
-            Some(segment) => self.shm = Some(segment),
+        // XWayland uses this segment as the window texture. Keeping the row
+        // stride fixed for a whole drag stops the compositor reinterpreting
+        // already drawn pixels. A wider total_width costs more per frame than
+        // the occasional recreation when the canvas stride grows.
+        let stride = width.max(1);
+        let rows = height
+            .saturating_add(height / 2)
+            .max(height.saturating_add(128));
+        let capacity = stride.saturating_mul(rows).saturating_mul(4).max(1 << 20);
+        match ShmSegment::new(&self.connection, capacity, stride) {
+            Some(segment) => {
+                self.shm = Some(segment);
+                self.shm_fresh = true;
+            }
             None => self.shm_failed = true,
         }
     }
@@ -922,17 +1082,42 @@ impl X11 {
     pub fn set_size(&mut self, width: u16, height: u16) {
         self.width = width;
         self.height = height;
-        if self
-            .shm
-            .as_ref()
-            .is_some_and(|segment| segment.length < width as usize * height as usize * 4)
-        {
-            self.destroy_shm();
+    }
+
+    /// Whether the window manager is waiting for the current frame to be
+    /// acknowledged through the `_NET_WM_SYNC_REQUEST` counter.
+    pub fn sync_pending(&self) -> bool {
+        self.sync_serial.is_some()
+    }
+
+    /// Frame cadence learned from the window manager's sync requests, when at
+    /// least two consecutive frame-paced requests have arrived.
+    pub fn sync_frame_interval(&self) -> Option<std::time::Duration> {
+        self.sync_interval
+    }
+
+    /// Acknowledges all repainting requested by the last
+    /// `_NET_WM_SYNC_REQUEST`, unblocking the next configure event.
+    pub fn acknowledge_sync(&mut self) {
+        let Some(serial) = self.sync_serial.take() else {
+            return;
+        };
+        let Some((basic, extended)) = self.sync_counters else {
+            return;
+        };
+        let mut sent = true;
+        for counter in [extended, basic] {
+            sent &= sync::set_counter(&self.connection, counter, serial).is_ok();
+        }
+        if sent {
+            let _ = self.connection.flush();
         }
     }
 
     pub fn poll(&mut self) -> Result<Vec<UiEvent>, String> {
         let mut events = Vec::new();
+        let mut resize_at: Option<usize> = None;
+        let original = (self.width, self.height);
         loop {
             let event = self
                 .connection
@@ -941,7 +1126,30 @@ impl X11 {
             let Some(event) = event else {
                 break;
             };
+            if let Event::ConfigureNotify(configure) = &event
+                && configure.window == self.window
+            {
+                self.set_size(configure.width, configure.height);
+                push_resize(
+                    &mut events,
+                    &mut resize_at,
+                    configure.width,
+                    configure.height,
+                );
+                continue;
+            }
             self.handle_event(event, &mut events);
+        }
+        if let Some(index) = resize_at
+            && (self.width, self.height) == original
+        {
+            events.remove(index);
+            resize_at = None;
+        }
+        // A configure exposes the new edge, which the resize path repaints
+        // itself. Keeping that Expose would force a full redraw every frame.
+        if resize_at.is_some() {
+            events.retain(|event| !matches!(event, UiEvent::Expose));
         }
         Ok(events)
     }
@@ -992,17 +1200,6 @@ impl X11 {
                     state: u16::from(event.state),
                 });
             }
-            Event::ConfigureNotify(event) => {
-                if event.window == self.window
-                    && (event.width != self.width || event.height != self.height)
-                {
-                    self.set_size(event.width, event.height);
-                    output.push(UiEvent::Resize {
-                        width: event.width,
-                        height: event.height,
-                    });
-                }
-            }
             Event::Expose(event) => {
                 if event.window == self.window && event.count == 0 {
                     output.push(UiEvent::Expose);
@@ -1027,9 +1224,31 @@ impl X11 {
                 if event.window == self.window
                     && event.type_ == self.atoms.wm_protocols
                     && event.format == 32
-                    && event.data.as_data32()[0] == self.atoms.wm_delete_window
                 {
-                    output.push(UiEvent::Close);
+                    let data = event.data.as_data32();
+                    if data[0] == self.atoms.wm_delete_window {
+                        output.push(UiEvent::Close);
+                    } else if data[0] == self.atoms.net_wm_sync_request
+                        && self.sync_counters.is_some()
+                    {
+                        let now = Instant::now();
+                        if let Some(previous) = self.sync_last_at {
+                            let delta = now.duration_since(previous);
+                            if delta >= std::time::Duration::from_millis(1)
+                                && delta <= std::time::Duration::from_millis(100)
+                            {
+                                self.sync_interval = Some(match self.sync_interval {
+                                    Some(old) => (old * 3 + delta) / 4,
+                                    None => delta,
+                                });
+                            }
+                        }
+                        self.sync_last_at = Some(now);
+                        self.sync_serial = Some(sync::Int64 {
+                            hi: data[3] as i32,
+                            lo: data[2],
+                        });
+                    }
                 }
             }
             Event::SelectionRequest(event) => {
@@ -1277,6 +1496,10 @@ impl X11 {
 
     pub fn shutdown(&mut self) {
         self.destroy_shm();
+        if let Some((basic, extended)) = self.sync_counters.take() {
+            let _ = sync::destroy_counter(&self.connection, basic);
+            let _ = sync::destroy_counter(&self.connection, extended);
+        }
         let _ = self.connection.free_gc(self.gc);
         let _ = self.connection.destroy_window(self.window);
         if let Some(colormap) = self.colormap.take() {
@@ -1298,6 +1521,8 @@ impl Atoms {
         for name in [
             "WM_PROTOCOLS",
             "WM_DELETE_WINDOW",
+            "_NET_WM_SYNC_REQUEST",
+            "_NET_WM_SYNC_REQUEST_COUNTER",
             "_NET_WM_NAME",
             "_NET_WM_PID",
             "_NET_WM_WINDOW_OPACITY",
@@ -1326,6 +1551,8 @@ impl Atoms {
         Ok(Self {
             wm_protocols: names["WM_PROTOCOLS"],
             wm_delete_window: names["WM_DELETE_WINDOW"],
+            net_wm_sync_request: names["_NET_WM_SYNC_REQUEST"],
+            net_wm_sync_request_counter: names["_NET_WM_SYNC_REQUEST_COUNTER"],
             net_wm_name: names["_NET_WM_NAME"],
             net_wm_pid: names["_NET_WM_PID"],
             net_wm_window_opacity: names["_NET_WM_WINDOW_OPACITY"],
@@ -1349,9 +1576,11 @@ impl Atoms {
 fn size_hints(padding: Padding, cell_width: u16, cell_height: u16, gutter: u16) -> WmSizeHints {
     let base_x = padding.x as i32 * 2 + gutter as i32;
     let base_y = padding.y as i32 * 2;
+    // No `size_increment`: snapping the window to whole cells makes its edge
+    // jump by a full cell on every configure event, even at the display
+    // refresh rate. Arbitrary pixel sizes let the edge track the pointer; the
+    // grid stays whole-cell and the remainder becomes background/padding.
     WmSizeHints {
-        base_size: Some((base_x, base_y)),
-        size_increment: Some((cell_width as i32, cell_height as i32)),
         min_size: Some((base_x + cell_width as i32, base_y + cell_height as i32)),
         ..WmSizeHints::new()
     }
@@ -1364,5 +1593,49 @@ fn mods_from_mask(mask: KeyButMask) -> Mods {
         control: flags & u16::from(KeyButMask::CONTROL) != 0,
         alt: flags & u16::from(KeyButMask::MOD1) != 0,
         super_key: flags & u16::from(KeyButMask::MOD4) != 0,
+    }
+}
+
+/// Replaces the resize event already queued for this batch instead of adding
+/// another one, so a burst of configure events produces a single repaint.
+fn push_resize(events: &mut Vec<UiEvent>, resize_at: &mut Option<usize>, width: u16, height: u16) {
+    let resize = UiEvent::Resize { width, height };
+    match *resize_at {
+        Some(index) => events[index] = resize,
+        None => {
+            *resize_at = Some(events.len());
+            events.push(resize);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for configure-event coalescing.
+
+    use super::*;
+
+    #[test]
+    fn resize_burst_keeps_only_the_last_size() {
+        let mut events = Vec::new();
+        let mut resize_at = None;
+        push_resize(&mut events, &mut resize_at, 80, 24);
+        events.push(UiEvent::Focus(true));
+        push_resize(&mut events, &mut resize_at, 100, 30);
+        push_resize(&mut events, &mut resize_at, 120, 40);
+        assert_eq!(events.len(), 2);
+        match events[0] {
+            UiEvent::Resize { width, height } => assert_eq!((width, height), (120, 40)),
+            ref other => panic!("expected a resize event, got {other:?}"),
+        }
+        assert!(matches!(events[1], UiEvent::Focus(true)));
+    }
+
+    #[test]
+    fn size_hints_do_not_snap_to_cells() {
+        let hints = size_hints(Padding { x: 2, y: 3 }, 10, 20, 12);
+        assert_eq!(hints.base_size, None);
+        assert_eq!(hints.size_increment, None);
+        assert_eq!(hints.min_size, Some((26, 26)));
     }
 }

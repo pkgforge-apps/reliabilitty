@@ -17,8 +17,12 @@ use crate::vt::{Attrs, Cell, Color, Terminal};
 /// A 32-bit pixel buffer. Opaque canvases use `0x00RRGGBB`; ARGB canvases
 /// use straight-alpha `0xAARRGGBB`.
 pub struct Canvas {
+    /// Visible width of the window.
     pub width: u16,
     pub height: u16,
+    /// Pixels per row in `pixels`. Stays fixed while the window is resized so
+    /// rows never have to be repacked and the shared texture keeps its layout.
+    pub stride: u16,
     pub pixels: Vec<u32>,
     /// True when pixels contain alpha and must be composited.
     pub argb: bool,
@@ -29,6 +33,7 @@ impl Canvas {
         Self {
             width,
             height,
+            stride: width,
             pixels: vec![0; width as usize * height as usize],
             argb: false,
         }
@@ -45,11 +50,67 @@ impl Canvas {
         (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
     }
 
-    pub fn resize(&mut self, width: u16, height: u16) {
+    /// Grows the row stride with headroom, repacking existing rows once.
+    /// Returns true when the layout changed and the whole texture must be sent.
+    pub fn ensure_stride(&mut self, width: u16, background: u32) -> bool {
+        if self.stride >= width {
+            return false;
+        }
+        let stride = width
+            .saturating_add((width / 2).min(512))
+            .max(width.saturating_add(64));
+        let old_stride = self.stride as usize;
+        let new_stride = stride as usize;
+        let rows = self.height as usize;
+        let mut pixels = vec![background; new_stride * rows];
+        for row in 0..rows {
+            let source = row * old_stride;
+            let destination = row * new_stride;
+            let cols = old_stride.min(new_stride);
+            pixels[destination..destination + cols]
+                .copy_from_slice(&self.pixels[source..source + cols]);
+        }
+        self.pixels = pixels;
+        self.stride = stride;
+        true
+    }
+
+    /// Resets the stride to the visible width after a drag settles.
+    pub fn compact_stride(&mut self, background: u32) {
+        if self.stride == self.width {
+            return;
+        }
+        let old_stride = self.stride as usize;
+        let new_stride = self.width as usize;
+        let rows = self.height as usize;
+        let mut pixels = vec![background; new_stride * rows];
+        for row in 0..rows {
+            let source = row * old_stride;
+            let destination = row * new_stride;
+            pixels[destination..destination + new_stride]
+                .copy_from_slice(&self.pixels[source..source + new_stride]);
+        }
+        self.pixels = pixels;
+        self.stride = self.width;
+    }
+
+    pub fn resize(&mut self, width: u16, height: u16, background: u32) {
+        let old_width = self.width as usize;
+        let old_height = self.height as usize;
+        let stride = self.stride as usize;
+        let rows = height as usize;
+        self.pixels.resize(stride * rows, background);
+        if width as usize > old_width {
+            for row in 0..old_height.min(rows) {
+                let start = row * stride + old_width;
+                let end = row * stride + width as usize;
+                if end <= self.pixels.len() {
+                    self.pixels[start..end].fill(background);
+                }
+            }
+        }
         self.width = width;
         self.height = height;
-        self.pixels.clear();
-        self.pixels.resize(width as usize * height as usize, 0);
     }
 
     pub fn fill(&mut self, color: u32) {
@@ -67,7 +128,7 @@ impl Canvas {
         if shift == 0 {
             return 0;
         }
-        let w = self.width as usize;
+        let w = self.stride as usize;
         let pixels = shift.unsigned_abs() as usize * w;
         let len = self.pixels.len();
         if shift > 0 {
@@ -85,8 +146,8 @@ impl Canvas {
             return;
         };
         for row in y0..y1 {
-            let start = row as usize * self.width as usize + x0 as usize;
-            let end = row as usize * self.width as usize + x1 as usize;
+            let start = row as usize * self.stride as usize + x0 as usize;
+            let end = row as usize * self.stride as usize + x1 as usize;
             self.pixels[start..end].fill(color);
         }
     }
@@ -99,7 +160,7 @@ impl Canvas {
         let argb = self.argb;
         for row in y0..y1 {
             let source_row = (row as i32 - y) as usize * width as usize;
-            let destination_row = row as usize * self.width as usize;
+            let destination_row = row as usize * self.stride as usize;
             for col in x0..x1 {
                 let alpha = data[source_row + (col as i32 - x) as usize] as u32;
                 if alpha == 0 {
@@ -122,7 +183,7 @@ impl Canvas {
         let argb = self.argb;
         for row in y0..y1 {
             let source_row = (row as i32 - y) as usize * width as usize;
-            let destination_row = row as usize * self.width as usize;
+            let destination_row = row as usize * self.stride as usize;
             for col in x0..x1 {
                 let source_index = (source_row + (col as i32 - x) as usize) * 4;
                 let alpha = data[source_index + 3] as u32;
@@ -1078,6 +1139,36 @@ mod tests {
         assert_eq!(canvas.pixels[3], 0);
         canvas.fill_rect(3, 3, 10, 10, 0x00ff00);
         assert_eq!(canvas.pixels[15], 0x00ff00);
+    }
+
+    #[test]
+    fn canvas_resize_keeps_a_fixed_stride_and_fills_new_edges() {
+        let mut canvas = Canvas::new(3, 2);
+        for (index, pixel) in canvas.pixels.iter_mut().enumerate() {
+            *pixel = 10 + index as u32;
+        }
+        assert!(canvas.ensure_stride(4, 99));
+        let stride = canvas.stride as usize;
+        assert!(stride >= 4);
+        canvas.resize(4, 3, 99);
+        assert_eq!(canvas.width, 4);
+        assert_eq!(canvas.height, 3);
+        assert_eq!(canvas.stride as usize, stride);
+        assert_eq!(&canvas.pixels[0..3], &[10, 11, 12]);
+        assert_eq!(canvas.pixels[3], 99);
+        assert_eq!(&canvas.pixels[stride..stride + 3], &[13, 14, 15]);
+        assert_eq!(canvas.pixels[stride + 3], 99);
+
+        // Shrinking must not repack the rows or change the stride.
+        canvas.resize(2, 3, 77);
+        assert_eq!(canvas.stride as usize, stride);
+        assert_eq!(&canvas.pixels[0..2], &[10, 11]);
+        assert_eq!(&canvas.pixels[stride..stride + 2], &[13, 14]);
+
+        canvas.compact_stride(77);
+        assert_eq!(canvas.stride, canvas.width);
+        assert_eq!(&canvas.pixels[0..2], &[10, 11]);
+        assert_eq!(&canvas.pixels[2..4], &[13, 14]);
     }
 
     #[test]
