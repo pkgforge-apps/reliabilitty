@@ -121,11 +121,12 @@ struct App {
     next_frame: Instant,
     frame_interval: Duration,
     resize_settle_at: Option<Instant>,
-    pending_pty_resize: Option<(usize, usize, usize, usize)>,
     pending_resize: Option<(u16, u16)>,
     resize_indicator_until: Option<Instant>,
     fast_resize: bool,
     resize_present_rects: Option<Vec<(u16, u16, u16, u16)>>,
+    redraw_overlays: bool,
+    overlay_rects: Vec<(u16, u16, u16, u16)>,
     last_pty_input: Instant,
     smoke: bool,
     rendered_once: bool,
@@ -370,11 +371,12 @@ pub fn run(cli: Cli) -> Result<(), String> {
         next_frame: now,
         frame_interval,
         resize_settle_at: None,
-        pending_pty_resize: None,
         pending_resize: None,
         resize_indicator_until: None,
         fast_resize: false,
         resize_present_rects: None,
+        redraw_overlays: false,
+        overlay_rects: Vec::new(),
         last_pty_input: now,
         smoke: cli.smoke,
         rendered_once: false,
@@ -483,9 +485,6 @@ impl App {
                 self.x11.background_alpha(),
             );
             self.canvas.compact_stride(background);
-            if let Some((cols, rows, width, height)) = self.pending_pty_resize.take() {
-                self.pty.resize(cols, rows, width, height);
-            }
             self.terminal.finish_deferred_resize();
         }
         if self
@@ -1411,18 +1410,46 @@ impl App {
         let rows = rows.max(1);
         let grid_changed = cols != self.terminal.width() || rows != self.terminal.height();
         if grid_changed {
-            // Reflow immediately: the text and scrollbar must follow the new
-            // width on the very same frame, not after the drag settles.
-            self.terminal
-                .resize(cols, rows, self.cell_width, self.cell_height);
-            self.terminal.mark_all();
-            self.redraw_all = true;
+            let old_cols = self.terminal.width();
+            let old_rows = self.terminal.height();
+            let old_cursor = (self.terminal.cursor.x, self.terminal.cursor.y);
             if from_configure {
-                // Defer only SIGWINCH so the shell does not repaint its prompt
-                // on every cell boundary crossed during the drag.
-                self.pending_pty_resize = Some((cols, rows, width as usize, height as usize));
-            } else {
+                // resize_line only pads or truncates cells; it never rewraps.
+                // The visible glyphs are therefore identical before and after
+                // a grid change, so a full redraw would repaint the same
+                // pixels. Erase only the two overlays whose geometry depends
+                // on cols/rows and let the fast path redraw them.
+                let background = pixel(
+                    &self.canvas,
+                    self.terminal.theme().background,
+                    self.x11.background_alpha(),
+                );
+                let mut rects = self.overlay_rects_for(old_cols, old_rows, old_cursor);
+                for &(x, y, w, h) in &rects {
+                    self.canvas
+                        .fill_rect(x as i32, y as i32, w as i32, h as i32, background);
+                }
+                self.terminal
+                    .resize(cols, rows, self.cell_width, self.cell_height);
+                let discarded = self.terminal.take_damage();
+                self.terminal.recycle_damage(discarded);
+                rects.extend(self.overlay_rects_for(
+                    cols,
+                    rows,
+                    (self.terminal.cursor.x, self.terminal.cursor.y),
+                ));
+                self.overlay_rects = rects;
+                self.redraw_overlays = true;
+                // Send SIGWINCH immediately. Deferring it until the drag
+                // settles makes the shell repaint its prompt late, which is
+                // visible as text lagging behind the window frame.
                 self.pty.resize(cols, rows, width as usize, height as usize);
+            } else {
+                self.terminal
+                    .resize(cols, rows, self.cell_width, self.cell_height);
+                self.pty.resize(cols, rows, width as usize, height as usize);
+                self.terminal.mark_all();
+                self.redraw_all = true;
             }
             self.resize_settle_at = Some(Instant::now() + Duration::from_millis(100));
         } else {
@@ -1440,7 +1467,7 @@ impl App {
                 self.x11.background_alpha(),
             );
             let fast = from_configure
-                && !grid_changed
+                && !self.terminal.has_selection()
                 && self.search.is_none()
                 && self.context_menu.is_none()
                 && self.bell_until.is_none();
@@ -1471,9 +1498,11 @@ impl App {
                 if height > old_height {
                     rects.push((0, old_height, width, height - old_height));
                 }
+                rects.extend(std::mem::take(&mut self.overlay_rects));
                 self.fast_resize = true;
                 self.resize_present_rects = Some(rects);
             } else {
+                self.overlay_rects.clear();
                 self.terminal.mark_all();
                 self.resize_present_rects = None;
             }
@@ -1484,8 +1513,39 @@ impl App {
             self.search_stale = false;
         }
         if !self.fast_resize {
+            self.overlay_rects.clear();
             self.redraw_all = true;
         }
+    }
+
+    fn overlay_rects_for(
+        &self,
+        cols: usize,
+        rows: usize,
+        cursor: (usize, usize),
+    ) -> Vec<(u16, u16, u16, u16)> {
+        let cw = self.cell_width as i32;
+        let ch = self.cell_height as i32;
+        let px = self.padding.x as i32;
+        let py = self.padding.y as i32;
+        let mut rects = Vec::new();
+        if self.terminal.scrollback_len() > 0 {
+            let x = px + cols as i32 * cw + 1;
+            rects.push((
+                x.max(0) as u16,
+                py.max(0) as u16,
+                (scrollbar::width(self.cell_width) as i32 - 1).max(0) as u16,
+                (rows as i32 * ch).max(0) as u16,
+            ));
+        }
+        let (cx, cy) = cursor;
+        rects.push((
+            (px + cx as i32 * cw).max(0) as u16,
+            (py + cy as i32 * ch).max(0) as u16,
+            cw.max(0) as u16,
+            ch.max(0) as u16,
+        ));
+        rects
     }
 
     fn indicator_rect(&self, width: u16, height: u16) -> (u16, u16, u16, u16) {
@@ -1668,14 +1728,38 @@ impl App {
         let extra_damage = damage.scroll != 0 || damage.rows.iter().any(|row| *row);
         let fast = self.fast_resize;
         self.fast_resize = false;
+        let redraw_overlays = self.redraw_overlays;
+        self.redraw_overlays = false;
         let fast_ok = fast
             && !self.redraw_all
             && !extra_damage
             && damage.is_empty()
             && self.bell_until.is_none()
             && self.search.is_none()
-            && self.context_menu.is_none();
+            && self.context_menu.is_none()
+            && !self.terminal.has_selection();
         if fast_ok {
+            if redraw_overlays {
+                // An empty damage makes Renderer::draw skip its clear and row
+                // loop but still draw the scrollbar and cursor, whose position
+                // depends on the new grid size.
+                let cursor_on = if self.focused {
+                    !self.cursor_blinking() || self.blink_on
+                } else {
+                    true
+                };
+                let (origin_x, origin_y) = self.origin();
+                self.renderer.draw(
+                    &mut self.canvas,
+                    &self.terminal,
+                    &crate::vt::Damage::default(),
+                    origin_x,
+                    origin_y,
+                    cursor_on,
+                    self.focused,
+                    self.x11.background_alpha(),
+                );
+            }
             self.draw_resize_indicator();
             match self.resize_present_rects.take() {
                 Some(rects) => self.x11.present_rects(&self.canvas, &rects),

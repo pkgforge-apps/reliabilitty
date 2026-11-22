@@ -145,9 +145,16 @@ impl Canvas {
         let Some((x0, y0, x1, y1)) = self.clip(x, y, width, height) else {
             return;
         };
+        let stride = self.stride as usize;
+        if x0 == 0 && x1 as usize == stride {
+            let start = y0 as usize * stride;
+            let end = y1 as usize * stride;
+            self.pixels[start..end].fill(color);
+            return;
+        }
         for row in y0..y1 {
-            let start = row as usize * self.stride as usize + x0 as usize;
-            let end = row as usize * self.stride as usize + x1 as usize;
+            let start = row as usize * stride + x0 as usize;
+            let end = row as usize * stride + x1 as usize;
             self.pixels[start..end].fill(color);
         }
     }
@@ -207,6 +214,9 @@ impl Canvas {
 }
 
 fn blend(destination: u32, source: u32, alpha: u32) -> u32 {
+    if alpha == 255 {
+        return source;
+    }
     let destination_r = (destination >> 16) & 0xff;
     let destination_g = (destination >> 8) & 0xff;
     let destination_b = destination & 0xff;
@@ -246,7 +256,16 @@ pub fn pixel(canvas: &Canvas, color: Rgb, alpha: u8) -> u32 {
 }
 
 fn blend_alpha(destination: u32, source: u32, alpha: u32) -> u32 {
+    // Fully covered pixels are by far the most common in a glyph mask; they
+    // need no division. A fully transparent destination is the other case
+    // where the general formula collapses exactly.
+    if alpha == 255 {
+        return 0xff00_0000 | (source & 0x00ff_ffff);
+    }
     let destination_alpha = destination >> 24;
+    if destination_alpha == 0 {
+        return (alpha << 24) | (source & 0x00ff_ffff);
+    }
     let inverse = 255 - alpha;
     let denominator = alpha * 255 + destination_alpha * inverse;
     if denominator == 0 {
@@ -494,7 +513,10 @@ impl Renderer {
         let theme = terminal.theme();
         let background = pixel(canvas, theme.background, background_alpha);
         if damage.all {
-            canvas.fill(background);
+            // Only the visible area needs clearing. A full-buffer fill would
+            // also paint the stride padding, and the per-row fill below would
+            // then paint the same pixels a second time.
+            canvas.fill_rect(0, 0, canvas.width as i32, canvas.height as i32, background);
         }
         let origin_x = padding_x;
         let origin_y = padding_y;
@@ -518,13 +540,15 @@ impl Renderer {
                 .map(|(index, item)| (item.start, item.end, Some(index) == search_current))
                 .collect();
             let y0 = origin_y + row as i32 * cell_h;
-            canvas.fill_rect(
-                origin_x,
-                y0,
-                terminal.width() as i32 * cell_w,
-                cell_h,
-                background,
-            );
+            if !damage.all {
+                canvas.fill_rect(
+                    origin_x,
+                    y0,
+                    terminal.width() as i32 * cell_w,
+                    cell_h,
+                    background,
+                );
+            }
             for col in 0..terminal.width() {
                 let Some(cell) = line.cells.get(col) else {
                     break;
@@ -1178,6 +1202,19 @@ mod tests {
         canvas.blend_mask(0, 0, 1, 1, &[128], [255, 255, 255]);
         let pixel = canvas.pixels[0];
         assert!((0x7f7f7f..=0x808080).contains(&pixel));
+    }
+
+    #[test]
+    fn fully_covered_and_transparent_destinations_skip_blending_math() {
+        let mut canvas = Canvas::new(2, 1);
+        canvas.fill(0x0012_3456);
+        canvas.blend_mask(0, 0, 1, 1, &[255], [0xab, 0xcd, 0xef]);
+        assert_eq!(canvas.pixels[0], 0x00ab_cdef);
+
+        canvas.argb = true;
+        canvas.pixels[1] = 0;
+        canvas.blend_mask(1, 0, 1, 1, &[128], [0x11, 0x22, 0x33]);
+        assert_eq!(canvas.pixels[1], 0x8011_2233);
     }
 
     #[test]

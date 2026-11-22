@@ -744,7 +744,10 @@ impl X11 {
                     if interval >= std::time::Duration::from_millis(1)
                         && interval <= std::time::Duration::from_millis(100)
                     {
-                        return interval;
+                        // XWayland reports a synthetic mode whose dot clock
+                        // can imply 50 Hz or less even on a fast VRR panel.
+                        // Never pace repaints slower than 120 Hz.
+                        return interval.min(std::time::Duration::from_micros(8_333));
                     }
                 }
             }
@@ -990,6 +993,8 @@ impl X11 {
                 ok &= self.write_rect(canvas, x0, y0, w, h);
             }
         }
+        // A resize discards the window's X pixmap even on a composited
+        // desktop, so re-upload the whole window from the shared segment.
         if ok && self.shm_copy(canvas, 0, 0, canvas.width as usize, canvas.height as usize) {
             return;
         }
