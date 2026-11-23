@@ -1,4 +1,15 @@
 
+## [0.1.19](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.18...v0.1.19) - 2026-11-23
+
+### Bug Fixes
+
+- Address resize review findings ([#45](https://github.com/pkgforge-apps/reliabilitty/pull/45)) - ([d867e80](https://github.com/pkgforge-apps/reliabilitty/commit/d867e803a531462b54c8dd2deef9ac5863b20c3a))
+
+### Performance
+
+- Optimize event loop, rendering, VT parsing and deduplicate code ([#46](https://github.com/pkgforge-apps/reliabilitty/pull/46)) - ([c78a8e0](https://github.com/pkgforge-apps/reliabilitty/commit/c78a8e01780b1d51873c119f665fba18face784a))
+- Keep interactive resizes smooth without flicker ([#43](https://github.com/pkgforge-apps/reliabilitty/pull/43)) - ([870ceb6](https://github.com/pkgforge-apps/reliabilitty/commit/870ceb6e0c158e8de6ca90d72741a3d00f62b9f0))
+
 ## [0.1.18](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.17...v0.1.18) - 2026-11-21
 
 ### Documentation
