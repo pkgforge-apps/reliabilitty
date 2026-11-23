@@ -22,7 +22,6 @@ appimage = false
 dirs = "7.0.0"
 fontdb = "0.24.0"
 libc = "0.2.191"
-mimalloc = { version = "0.1.52", default-features = false, features = ["no_thp"] }
 swash = "0.2.10"
 unicode-normalization = "0.1.26"
 unicode-width = "0.2.3"

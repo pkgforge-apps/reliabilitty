@@ -3,6 +3,7 @@
 mod app;
 mod cli;
 mod config;
+mod fonts;
 mod input;
 mod pty;
 mod render;
@@ -12,9 +13,6 @@ mod signals;
 mod theme;
 mod vt;
 mod x11;
-
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

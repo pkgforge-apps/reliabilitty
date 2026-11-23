@@ -11,6 +11,7 @@ use swash::{FontRef, GlyphId};
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::{FontConfig, FontDescription};
+use crate::fonts::FontIndex;
 use crate::scrollbar;
 use crate::theme::{self, Rgb, Theme};
 use crate::vt::{Attrs, Cell, Color, Terminal};
@@ -385,15 +386,17 @@ fn blend_alpha(destination: u32, source: u32, alpha: u32) -> u32 {
     (out_alpha << 24) | (red << 16) | (green << 8) | blue
 }
 
+type SharedFontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 struct LoadedFont {
-    data: Arc<Vec<u8>>,
+    data: SharedFontBytes,
     index: u32,
     synthetic_bold: bool,
 }
 
 impl LoadedFont {
     fn font(&self) -> Option<FontRef<'_>> {
-        FontRef::from_index(&self.data, self.index as usize)
+        FontRef::from_index((*self.data).as_ref(), self.index as usize)
     }
 }
 
@@ -434,7 +437,7 @@ pub struct Renderer {
     unfocused_hollow: bool,
     fonts: Vec<LoadedFont>,
     primary: [usize; 4],
-    database: Arc<Database>,
+    font_index: FontIndex,
     fallback_families: Vec<String>,
     loaded_families: HashMap<String, Option<u32>>,
     ascii_glyphs: [Option<Option<GlyphRef>>; ASCII_CACHE_LEN],
@@ -450,7 +453,7 @@ impl Renderer {
         config: &FontConfig,
         dpi: f32,
         size_override: Option<f32>,
-        database: Arc<Database>,
+        mut font_index: FontIndex,
     ) -> Result<Self, String> {
         let size_points = size_override.unwrap_or(config.size);
         let dpi = if config.dpi > 0.0 {
@@ -460,18 +463,41 @@ impl Renderer {
         };
         let size_px = (size_points * dpi / 72.0).max(1.0);
 
-        let regular_id = query_face(&database, &config.normal, Weight::NORMAL, Style::Normal)
-            .ok_or_else(|| format!("no font found for family {:?}", config.normal.family))?;
-        let (regular_data, regular_index) = face_data(&database, regular_id)?;
-        let regular_data = Arc::new(regular_data);
+        font_index.load_matching_family(&config.normal.family);
+        for extra in [&config.bold, &config.italic, &config.bold_italic]
+            .into_iter()
+            .flatten()
+        {
+            font_index.load_matching_family(&extra.family);
+        }
+
+        let regular_id = match query_face(
+            font_index.database(),
+            &config.normal,
+            Weight::NORMAL,
+            Style::Normal,
+        ) {
+            Some(id) => id,
+            None => {
+                font_index.ensure_full();
+                query_face(
+                    font_index.database(),
+                    &config.normal,
+                    Weight::NORMAL,
+                    Style::Normal,
+                )
+                .ok_or_else(|| format!("no font found for family {:?}", config.normal.family))?
+            }
+        };
+        let (regular_data, regular_index) = face_data(font_index.database_mut(), regular_id)?;
         let regular = LoadedFont {
-            data: regular_data.clone(),
+            data: regular_data,
             index: regular_index,
             synthetic_bold: false,
         };
 
         let bold = load_style(
-            &database,
+            &mut font_index,
             &config.normal,
             config.bold.as_ref(),
             Weight::BOLD,
@@ -480,7 +506,7 @@ impl Renderer {
             &regular,
         );
         let italic = load_style(
-            &database,
+            &mut font_index,
             &config.normal,
             config.italic.as_ref(),
             Weight::NORMAL,
@@ -489,7 +515,7 @@ impl Renderer {
             &regular,
         );
         let bold_italic = load_style(
-            &database,
+            &mut font_index,
             &config.normal,
             config.bold_italic.as_ref(),
             Weight::BOLD,
@@ -553,7 +579,7 @@ impl Renderer {
             unfocused_hollow: true,
             fonts: std::mem::take(&mut fonts),
             primary,
-            database,
+            font_index,
             fallback_families,
             loaded_families: HashMap::new(),
             ascii_glyphs: [None; ASCII_CACHE_LEN],
@@ -563,6 +589,27 @@ impl Renderer {
         };
         renderer.remember_primary_families(config);
         Ok(renderer)
+    }
+
+    /// Rebuilds the renderer in place, keeping its cached `FontIndex`.
+    pub fn rebuild(
+        &mut self,
+        config: &FontConfig,
+        dpi: f32,
+        size_override: Option<f32>,
+    ) -> Result<(), String> {
+        let index = std::mem::replace(&mut self.font_index, FontIndex::empty());
+        match Renderer::new(config, dpi, size_override, index) {
+            Ok(next) => {
+                *self = next;
+                Ok(())
+            }
+            Err(error) => {
+                // Restore a fresh index on error so the current renderer stays valid.
+                self.font_index = FontIndex::new();
+                Err(error)
+            }
+        }
     }
 
     pub fn set_cursor_options(&mut self, thickness: f32, unfocused_hollow: bool) {
@@ -659,7 +706,7 @@ impl Renderer {
             }
             let mut match_index = 0usize;
             for col in 0..terminal.width() {
-                let Some(cell) = line.cells.get(col) else {
+                let Some(cell) = line.cell(col) else {
                     break;
                 };
                 if cell.width == 0 {
@@ -687,7 +734,7 @@ impl Renderer {
                 self.draw_cell(
                     canvas,
                     terminal,
-                    *cell,
+                    cell,
                     origin_x + col as i32 * cell_w,
                     y0,
                     selected,
@@ -727,7 +774,7 @@ impl Renderer {
             let row = terminal.cursor.y;
             let col = terminal.cursor.x;
             if let Some(line) = terminal.visible_line(row)
-                && let Some(cell) = line.cells.get(col).copied()
+                && let Some(cell) = line.cell(col)
             {
                 let x = origin_x + col as i32 * cell_w;
                 let y = origin_y + row as i32 * cell_h;
@@ -1011,23 +1058,31 @@ impl Renderer {
         if let Some(value) = self.loaded_families.get(&key) {
             return *value;
         }
-        let family = &self.fallback_families[index];
+        let family = self.fallback_families[index].clone();
+        self.font_index.load_matching_family(&family);
         let query = Query {
-            families: &[family_value(family)],
+            families: &[family_value(&family)],
             weight: Weight::NORMAL,
             stretch: Stretch::Normal,
             style: Style::Normal,
         };
-        let Some(id) = self.database.query(&query) else {
+        let id = match self.font_index.database().query(&query) {
+            Some(id) => Some(id),
+            None => {
+                self.font_index.ensure_full();
+                self.font_index.database().query(&query)
+            }
+        };
+        let Some(id) = id else {
             self.loaded_families.insert(key, None);
             return None;
         };
-        let Ok((data, index)) = face_data(&self.database, id) else {
+        let Ok((data, index)) = face_data(self.font_index.database_mut(), id) else {
             self.loaded_families.insert(key, None);
             return None;
         };
         let font = LoadedFont {
-            data: Arc::new(data),
+            data,
             index,
             synthetic_bold: false,
         };
@@ -1161,15 +1216,17 @@ fn query_face(
     None
 }
 
-fn face_data(database: &Database, id: fontdb::ID) -> Result<(Vec<u8>, u32), String> {
-    database
-        .with_face_data(id, |data, index| (data.to_vec(), index))
+fn face_data(database: &mut Database, id: fontdb::ID) -> Result<(SharedFontBytes, u32), String> {
+    // SAFETY: system font files are immutable during a terminal session;
+    // mmap-backing avoids copying megabytes of font bytes into anonymous RAM
+    // and lets the OS share clean font pages across terminal instances.
+    unsafe { database.make_shared_face_data(id) }
         .ok_or_else(|| "font data is unavailable".to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn load_style(
-    database: &Database,
+    font_index: &mut FontIndex,
     normal: &FontDescription,
     override_desc: Option<&FontDescription>,
     weight: Weight,
@@ -1183,17 +1240,22 @@ fn load_style(
         index: regular.index,
         synthetic_bold: weight.0 > face_weight(regular),
     };
-    let Some(id) = query_face(database, description, weight, style) else {
+    let mut id = query_face(font_index.database(), description, weight, style);
+    if id.is_none() && override_desc.is_some() {
+        font_index.ensure_full();
+        id = query_face(font_index.database(), description, weight, style);
+    }
+    let Some(id) = id else {
         return fallback();
     };
     if id == regular_id {
         return fallback();
     }
-    let Ok((data, index)) = face_data(database, id) else {
+    let Ok((data, index)) = face_data(font_index.database_mut(), id) else {
         return fallback();
     };
     let loaded = LoadedFont {
-        data: Arc::new(data),
+        data,
         index,
         synthetic_bold: false,
     };

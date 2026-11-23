@@ -214,17 +214,39 @@ impl Parser {
         while index < bytes.len() {
             if matches!(self.state, State::Ground) && self.utf8.needed == 0 {
                 let b = bytes[index];
-                if b >= 0x20 && b != 0x7f {
+                if (0x20..0x7f).contains(&b) {
                     let start = index;
-                    let mut ascii_only = b < 0x80;
                     index += 1;
-                    while index < bytes.len() && bytes[index] >= 0x20 && bytes[index] != 0x7f {
-                        ascii_only &= bytes[index] < 0x80;
+                    while index < bytes.len() {
+                        let next = bytes[index];
+                        if !(0x20..0x7f).contains(&next) {
+                            break;
+                        }
                         index += 1;
                     }
-                    if ascii_only {
-                        terminal.print_ascii_run(&bytes[start..index]);
-                        continue;
+                    terminal.print_ascii_run(&bytes[start..index]);
+                    continue;
+                }
+                if b == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    terminal.crlf();
+                    index += 2;
+                    continue;
+                }
+                if b == b'\n' {
+                    terminal.index();
+                    index += 1;
+                    continue;
+                }
+                if b == b'\r' {
+                    terminal.carriage_return();
+                    index += 1;
+                    continue;
+                }
+                if b >= 0x80 {
+                    let start = index;
+                    index += 1;
+                    while index < bytes.len() && bytes[index] >= 0x20 && bytes[index] != 0x7f {
+                        index += 1;
                     }
                     let text = match std::str::from_utf8(&bytes[start..index]) {
                         Ok(text) => text,

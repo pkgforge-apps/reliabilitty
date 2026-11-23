@@ -120,6 +120,8 @@ pub struct Line {
     /// Cells, always exactly the terminal width after a resize.
     pub cells: Vec<Cell>,
     pub wrapped: bool,
+    /// True if any wide (width != 1) cell may exist on this line.
+    has_wide: bool,
     /// Columns written since the last clear. Cells outside the range are
     /// guaranteed blank, so recycling only has to clear the range.
     written_min: usize,
@@ -133,6 +135,7 @@ impl Line {
             id,
             cells,
             wrapped: false,
+            has_wide: false,
             written_min: usize::MAX,
             written_max: 0,
             revision: 0,
@@ -167,10 +170,9 @@ impl Line {
 
     fn clear_written(&mut self) {
         if self.written_min <= self.written_max {
-            for cell in &mut self.cells[self.written_min..=self.written_max] {
-                *cell = Cell::blank();
-            }
+            self.cells[self.written_min..=self.written_max].fill(Cell::blank());
         }
+        self.has_wide = false;
         self.written_min = usize::MAX;
         self.written_max = 0;
         self.revision = self.revision.wrapping_add(1);
@@ -214,6 +216,225 @@ impl Line {
             attrs,
             width: 1,
         };
+    }
+
+    /// Writes an ASCII slice onto this line starting at `x0`. When the line
+    /// contains no wide characters, skips per-cell width checks altogether.
+    #[inline]
+    fn write_ascii_slice(
+        &mut self,
+        x0: usize,
+        bytes: &[u8],
+        fg: Color,
+        bg: Color,
+        attrs: Attrs,
+        meta: u32,
+    ) {
+        if !self.has_wide {
+            let cells = &mut self.cells[x0..x0 + bytes.len()];
+            for (cell, &byte) in cells.iter_mut().zip(bytes) {
+                *cell = Cell {
+                    ch: byte as char,
+                    meta,
+                    fg,
+                    bg,
+                    attrs,
+                    width: 1,
+                };
+            }
+            return;
+        }
+        for (index, &byte) in bytes.iter().enumerate() {
+            self.write_ascii(x0 + index, byte, fg, bg, attrs, meta);
+        }
+    }
+}
+
+/// Metadata for a scrollback row stored inside `ScrollbackStore`'s chunked arena.
+#[derive(Clone, Debug)]
+struct ScrollbackEntry {
+    id: u64,
+    wrapped: bool,
+    revision: u64,
+    chunk: usize,
+    offset: usize,
+    len: usize,
+    cols: usize,
+}
+
+/// Chunked arena for scrollback history.
+///
+/// Instead of allocating a `Vec<Cell>` per scrollback line (up to 10,000+
+/// individual heap allocations when scrolling), each pushed line appends only
+/// its written prefix into a contiguous chunk and the active screen line is
+/// recycled immediately with zero allocations.
+#[derive(Debug)]
+struct ScrollbackStore {
+    chunks: VecDeque<Vec<Cell>>,
+    free_chunks: Vec<Vec<Cell>>,
+    base_chunk: usize,
+    entries: VecDeque<ScrollbackEntry>,
+}
+
+const SCROLLBACK_CHUNK_CELLS: usize = 32 * 1024;
+
+impl ScrollbackStore {
+    fn new() -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            free_chunks: Vec::new(),
+            base_chunk: 0,
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.free_chunks.clear();
+        self.base_chunk = 0;
+        self.entries.clear();
+    }
+
+    fn push_line(&mut self, line: &Line, cols: usize, history: usize) {
+        if history == 0 {
+            return;
+        }
+        // Only store up to the rightmost written column (or 0 for a blank line).
+        let stored_len = if line.written_min <= line.written_max {
+            (line.written_max + 1).min(line.cells.len())
+        } else {
+            0
+        };
+        let (chunk, offset) = if stored_len == 0 {
+            let current = self.base_chunk + self.chunks.len().saturating_sub(1);
+            (current, 0)
+        } else {
+            let need_new = self
+                .chunks
+                .back()
+                .is_none_or(|buf| buf.len() + stored_len > buf.capacity());
+            if need_new {
+                // Recycle an evicted chunk if one is free instead of returning
+                // it to the allocator and re-faulting fresh pages on the next chunk.
+                let mut recycled = None;
+                while let Some(mut buf) = self.free_chunks.pop() {
+                    if buf.capacity() >= stored_len {
+                        buf.clear();
+                        recycled = Some(buf);
+                        break;
+                    }
+                }
+                let buf = recycled
+                    .unwrap_or_else(|| Vec::with_capacity(SCROLLBACK_CHUNK_CELLS.max(stored_len)));
+                self.chunks.push_back(buf);
+            }
+            let chunk_id = self.base_chunk + self.chunks.len() - 1;
+            let buf = self.chunks.back_mut().unwrap();
+            let offset = buf.len();
+            buf.extend_from_slice(&line.cells[..stored_len]);
+            (chunk_id, offset)
+        };
+        self.entries.push_back(ScrollbackEntry {
+            id: line.id,
+            wrapped: line.wrapped,
+            revision: line.revision,
+            chunk,
+            offset,
+            len: stored_len,
+            cols,
+        });
+        while self.entries.len() > history {
+            self.entries.pop_front();
+        }
+        self.reclaim_chunks();
+    }
+
+    fn reclaim_chunks(&mut self) {
+        let Some(oldest) = self.entries.front() else {
+            self.chunks.clear();
+            self.free_chunks.clear();
+            return;
+        };
+        while !self.chunks.is_empty() && self.base_chunk < oldest.chunk {
+            if let Some(mut buf) = self.chunks.pop_front() {
+                if self.free_chunks.len() < 2 {
+                    buf.clear();
+                    self.free_chunks.push(buf);
+                }
+            }
+            self.base_chunk += 1;
+        }
+    }
+
+    fn cells_of(&self, entry: &ScrollbackEntry) -> &[Cell] {
+        if entry.len == 0 {
+            return &[];
+        }
+        let local = entry.chunk.saturating_sub(self.base_chunk);
+        match self.chunks.get(local) {
+            Some(buf) => &buf[entry.offset..entry.offset + entry.len],
+            None => &[],
+        }
+    }
+
+    fn get_cells(&self, index: usize) -> Option<(&ScrollbackEntry, &[Cell])> {
+        let entry = self.entries.get(index)?;
+        Some((entry, self.cells_of(entry)))
+    }
+
+    fn resize_all(&mut self, cols: usize) {
+        for entry in &mut self.entries {
+            entry.cols = cols;
+            if entry.len > cols {
+                entry.len = cols;
+            }
+            entry.revision = entry.revision.wrapping_add(1);
+        }
+    }
+}
+
+/// Borrowed view of either a live screen line or a compact scrollback row.
+/// Cells beyond `cells.len()` up to `cols` are blank.
+#[derive(Clone, Copy)]
+pub struct LineView<'a> {
+    pub id: u64,
+    pub cells: &'a [Cell],
+    pub cols: usize,
+    pub wrapped: bool,
+    revision: u64,
+}
+
+impl<'a> LineView<'a> {
+    fn from_line(line: &'a Line) -> Self {
+        Self {
+            id: line.id,
+            cells: &line.cells,
+            cols: line.cells.len(),
+            wrapped: line.wrapped,
+            revision: line.revision,
+        }
+    }
+
+    fn from_scrollback(entry: &ScrollbackEntry, cells: &'a [Cell]) -> Self {
+        Self {
+            id: entry.id,
+            cells,
+            cols: entry.cols.max(1),
+            wrapped: entry.wrapped,
+            revision: entry.revision,
+        }
+    }
+
+    #[inline]
+    pub fn cell(&self, col: usize) -> Option<Cell> {
+        if col >= self.cols {
+            return None;
+        }
+        Some(self.cells.get(col).copied().unwrap_or_else(Cell::blank))
     }
 }
 
@@ -377,7 +598,7 @@ pub struct Terminal {
     pub window_height: u16,
     main: VecDeque<Line>,
     alt: Option<VecDeque<Line>>,
-    scrollback: VecDeque<Line>,
+    scrollback: ScrollbackStore,
     history: usize,
     pub cursor: Cursor,
     pub pen: Pen,
@@ -462,7 +683,7 @@ impl Terminal {
             window_height: 0,
             main: VecDeque::new(),
             alt: None,
-            scrollback: VecDeque::new(),
+            scrollback: ScrollbackStore::new(),
             history,
             cursor: Cursor {
                 x: 0,
@@ -555,7 +776,7 @@ impl Terminal {
 
     #[cfg(test)]
     pub fn scrollback_cells_len(&self, index: usize) -> usize {
-        self.scrollback[index].cells.len()
+        self.scrollback.entries[index].cols
     }
 
     pub fn scroll_offset(&self) -> usize {
@@ -692,54 +913,67 @@ impl Terminal {
         self.region_offset = 0;
     }
 
-    fn find_line(&self, id: u64) -> Option<&Line> {
-        self.lines()
+    fn find_line(&self, id: u64) -> Option<LineView<'_>> {
+        if let Some(line) = self.lines().iter().find(|line| line.id == id) {
+            return Some(LineView::from_line(line));
+        }
+        self.scrollback
+            .entries
             .iter()
-            .chain(self.scrollback.iter())
-            .find(|line| line.id == id)
+            .find(|entry| entry.id == id)
+            .map(|entry| LineView::from_scrollback(entry, self.scrollback.cells_of(entry)))
     }
 
-    fn all_lines(&self) -> Vec<&Line> {
+    fn all_lines(&self) -> Vec<LineView<'_>> {
         let active = self.lines();
         let mut lines = Vec::with_capacity(self.scrollback.len() + active.len());
-        lines.extend(self.scrollback.iter());
+        for entry in &self.scrollback.entries {
+            lines.push(LineView::from_scrollback(
+                entry,
+                self.scrollback.cells_of(entry),
+            ));
+        }
         for row in 0..self.rows {
-            lines.push(&active[self.physical_row(row)]);
+            lines.push(LineView::from_line(&active[self.physical_row(row)]));
         }
         lines
     }
 
-    fn search_lines(&self) -> Vec<&Line> {
+    fn search_lines(&self) -> Vec<LineView<'_>> {
         if self.in_alt() {
             let active = self.lines();
             (0..self.rows)
-                .map(|row| &active[self.physical_row(row)])
+                .map(|row| LineView::from_line(&active[self.physical_row(row)]))
                 .collect()
         } else {
             self.all_lines()
         }
     }
 
-    pub fn visible_line(&self, row: usize) -> Option<&Line> {
+    pub fn visible_line(&self, row: usize) -> Option<LineView<'_>> {
         if row >= self.rows {
             return None;
         }
         if self.scroll_offset == 0 {
-            return Some(self.line(row));
+            return Some(LineView::from_line(self.line(row)));
         }
         let saved = self.scrollback.len();
         let start = saved.saturating_sub(self.scroll_offset);
         let index = start + row;
         if index < saved {
-            self.scrollback.get(index)
+            self.scrollback
+                .get_cells(index)
+                .map(|(entry, cells)| LineView::from_scrollback(entry, cells))
         } else {
-            self.lines().get(self.physical_row(index - saved))
+            self.lines()
+                .get(self.physical_row(index - saved))
+                .map(LineView::from_line)
         }
     }
 
     pub fn anchor_at(&self, row: usize, col: usize) -> Option<Anchor> {
         let line = self.visible_line(row)?;
-        let col = col.min(line.cells.len().saturating_sub(1));
+        let col = col.min(line.cols.saturating_sub(1));
         Some(Anchor { line: line.id, col })
     }
 
@@ -816,7 +1050,7 @@ impl Terminal {
     /// walking back to it.
     pub fn link_at(&self, row: usize, col: usize) -> Option<&str> {
         let line = self.visible_line(row)?;
-        let mut col = col.min(line.cells.len().saturating_sub(1));
+        let mut col = col.min(line.cols.saturating_sub(1));
         while col > 0 && line.cells.get(col).is_some_and(|cell| cell.width == 0) {
             col -= 1;
         }
@@ -873,25 +1107,27 @@ impl Terminal {
 
         let mut text = String::new();
         for (index, line) in lines.iter().enumerate().take(last + 1).skip(first) {
-            let line = *line;
-            let mut from = if index == first { start_col } else { 0 };
-            let mut to = if index == last {
+            let from = if index == first { start_col } else { 0 };
+            let to = if index == last {
                 end_col
             } else {
-                line.cells.len().saturating_sub(1)
-            };
-            to = to.min(line.cells.len().saturating_sub(1));
-            from = from.min(to);
-            while to > from && line.cells[to].is_blank() {
-                to -= 1;
+                line.cols.saturating_sub(1)
             }
-            for cell in &line.cells[from..=to] {
-                if cell.width == 0 {
-                    continue;
+            .min(line.cols.saturating_sub(1));
+            if from < line.cells.len() {
+                let mut stored_to = to.min(line.cells.len().saturating_sub(1));
+                let stored_from = from.min(stored_to);
+                while stored_to > stored_from && line.cells[stored_to].is_blank() {
+                    stored_to -= 1;
                 }
-                text.push(cell.ch);
-                if let Some(extra) = self.cell_extra(*cell) {
-                    text.push_str(extra);
+                for cell in &line.cells[stored_from..=stored_to] {
+                    if cell.width == 0 {
+                        continue;
+                    }
+                    text.push(cell.ch);
+                    if let Some(extra) = self.cell_extra(*cell) {
+                        text.push_str(extra);
+                    }
                 }
             }
             if index != last && (selection.mode == SelectionMode::Line || !line.wrapped) {
@@ -914,7 +1150,7 @@ impl Terminal {
             SelectionMode::Line => {
                 let last = self
                     .find_line(anchor.line)
-                    .map(|line| line.cells.len().saturating_sub(1))
+                    .map(|line| line.cols.saturating_sub(1))
                     .unwrap_or(0);
                 (
                     Anchor {
@@ -945,7 +1181,7 @@ impl Terminal {
             SelectionMode::Line => {
                 let last = self
                     .find_line(anchor.line)
-                    .map(|line| line.cells.len().saturating_sub(1))
+                    .map(|line| line.cols.saturating_sub(1))
                     .unwrap_or(0);
                 Anchor {
                     line: anchor.line,
@@ -967,7 +1203,7 @@ impl Terminal {
         let Some(last) = self.visible_line(self.rows - 1) else {
             return;
         };
-        let last_col = last.cells.len().saturating_sub(1);
+        let last_col = last.cols.saturating_sub(1);
         self.selection = Some(Selection {
             start: Anchor {
                 line: first_id,
@@ -990,13 +1226,13 @@ impl Terminal {
 
     fn collect_search_matches(
         &self,
-        lines: &[&Line],
+        lines: &[LineView<'_>],
         needle: &[char],
         mut old_cache: HashMap<u64, CachedLine>,
     ) -> (Vec<(usize, SearchMatch)>, HashMap<u64, CachedLine>) {
         let mut cache = HashMap::with_capacity(lines.len());
         let mut indexed = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
+        for (index, &line) in lines.iter().enumerate() {
             let line_matches = match old_cache.remove(&line.id) {
                 Some(cached) if cached.revision == line.revision => cached.matches,
                 _ => self.scan_line(line, needle),
@@ -1130,7 +1366,7 @@ impl Terminal {
             .map(|state| state.current)
     }
 
-    fn scan_line(&self, line: &Line, needle: &[char]) -> Vec<SearchMatch> {
+    fn scan_line(&self, line: LineView<'_>, needle: &[char]) -> Vec<SearchMatch> {
         let mut matches = Vec::new();
         if needle.is_empty() {
             return matches;
@@ -1152,7 +1388,7 @@ impl Terminal {
         matches
     }
 
-    fn folded_line(&self, line: &Line) -> (Vec<char>, Vec<usize>) {
+    fn folded_line(&self, line: LineView<'_>) -> (Vec<char>, Vec<usize>) {
         let end = line
             .cells
             .iter()
@@ -1211,7 +1447,7 @@ impl Terminal {
         let Some(line) = self.find_line(anchor.line) else {
             return (anchor, anchor);
         };
-        let mut from = anchor.col.min(line.cells.len().saturating_sub(1));
+        let mut from = anchor.col.min(line.cols.saturating_sub(1));
         let mut to = from;
         if !is_word_char(self.cell_char(line, from)) {
             return (anchor, anchor);
@@ -1219,7 +1455,7 @@ impl Terminal {
         while from > 0 && is_word_char(self.cell_char(line, from - 1)) {
             from -= 1;
         }
-        while to + 1 < line.cells.len() && is_word_char(self.cell_char(line, to + 1)) {
+        while to + 1 < line.cols && is_word_char(self.cell_char(line, to + 1)) {
             to += 1;
         }
         (
@@ -1234,7 +1470,7 @@ impl Terminal {
         )
     }
 
-    fn cell_char(&self, line: &Line, col: usize) -> char {
+    fn cell_char(&self, line: LineView<'_>, col: usize) -> char {
         line.cells.get(col).map(|cell| cell.ch).unwrap_or(' ')
     }
 
@@ -1466,10 +1702,7 @@ impl Terminal {
             return;
         }
         self.pending_scrollback_resize = false;
-        let cols = self.cols;
-        for line in &mut self.scrollback {
-            resize_line(line, cols);
-        }
+        self.scrollback.resize_all(self.cols);
     }
 
     pub fn set_window_pixels(&mut self, width: u16, height: u16) {
@@ -1651,6 +1884,7 @@ impl Terminal {
             continuation.ch = ' ';
             continuation.width = 0;
             line.cells[x + 1] = continuation;
+            line.has_wide = true;
         }
         line.cells[x] = cell;
         line.mark_written_range(x, x + width - 1);
@@ -1706,24 +1940,22 @@ impl Terminal {
                 let lines = self.lines_mut();
                 let mut x = x0;
                 let mut physical = map(start_y);
-                let mut row_start = x0;
-                for &byte in bytes {
+                let mut offset = 0usize;
+                while offset < bytes.len() {
+                    let take = (bytes.len() - offset).min(cols - x);
                     let line = &mut lines[physical];
-                    line.write_ascii(x, byte, fg, bg, attrs, meta);
+                    line.write_ascii_slice(x, &bytes[offset..offset + take], fg, bg, attrs, meta);
+                    line.mark_written_range(x, x + take - 1);
                     line.wrapped = false;
-                    x += 1;
+                    x += take;
+                    offset += take;
                     if x == cols {
-                        line.mark_written_range(row_start, cols - 1);
                         x = 0;
-                        row_start = 0;
                         physical += 1;
                         if physical > region_bottom {
                             physical = region_top;
                         }
                     }
-                }
-                if x > 0 {
-                    lines[physical].mark_written_range(row_start, x - 1);
                 }
             }
             for row in start_y..=end_row {
@@ -1757,9 +1989,7 @@ impl Terminal {
             let last = {
                 let lines = self.lines_mut();
                 let line = &mut lines[map(y)];
-                for (index, &byte) in segment.iter().enumerate() {
-                    line.write_ascii(x0 + index, byte, fg, bg, attrs, meta);
-                }
+                line.write_ascii_slice(x0, segment, fg, bg, attrs, meta);
                 line.mark_written_range(x0, x0 + segment.len() - 1);
                 line.wrapped = false;
                 segment[segment.len() - 1] as char
@@ -1835,6 +2065,7 @@ impl Terminal {
                             width: 0,
                             ..cell
                         };
+                        line.has_wide = true;
                     }
                     last = Some(ch);
                     last_x = x;
@@ -1918,6 +2149,7 @@ impl Terminal {
                         };
                         continuation.width = 0;
                         line.cells[next] = continuation;
+                        line.has_wide = true;
                         line.mark_written(next);
                         advance = true;
                     }
@@ -2027,8 +2259,33 @@ impl Terminal {
         }
     }
 
+    /// Moves the cursor to column 0 without touching rows.
+    #[inline]
+    pub(super) fn carriage_return(&mut self) {
+        self.cursor.x = 0;
+        self.wrap_pending = false;
+        self.last_printed = None;
+    }
+
+    /// Moves the cursor to column 0 and down one line (CR+LF fast path).
+    #[inline]
+    pub(super) fn crlf(&mut self) {
+        self.cursor.x = 0;
+        self.wrap_pending = false;
+        self.last_printed = None;
+        if self.cursor.y == self.scroll_bottom {
+            self.scroll_up(1);
+        } else if self.cursor.y + 1 < self.rows {
+            let old = self.cursor.y;
+            self.cursor.y += 1;
+            self.mark_row(old);
+            self.mark_row(self.cursor.y);
+        }
+    }
+
     /// Moves the cursor down one line, scrolling at the bottom margin.
-    fn index(&mut self) {
+    #[inline]
+    pub(super) fn index(&mut self) {
         if self.cursor.y == self.scroll_bottom {
             self.scroll_up(1);
         } else if self.cursor.y + 1 < self.rows {
@@ -2048,20 +2305,20 @@ impl Terminal {
     }
 
     fn scroll_up(&mut self, count: usize) {
-        // Single-line full-screen scroll with history is the common case in
-        // streaming output. Skip the general region machinery entirely.
+        // Single-line full-screen scroll on the main screen is the common case
+        // in streaming output. Archive into the chunked scrollback arena and
+        // recycle the live line immediately with zero heap allocations.
         if count == 1
             && self.scroll_top == 0
             && self.scroll_bottom + 1 == self.rows
             && self.scroll_offset == 0
             && self.region_offset == 0
             && self.alt.is_none()
-            && self.history != 0
-            && self.scrollback.len() == self.history
         {
-            let removed = self.main.pop_front().unwrap();
-            self.scrollback.push_back(removed);
-            let mut line = self.scrollback.pop_front().unwrap();
+            let mut line = self.main.pop_front().unwrap();
+            if self.history != 0 {
+                self.scrollback.push_line(&line, self.cols, self.history);
+            }
             let id = self.next_line_id();
             blank_in_place(&mut line, id);
             self.main.push_back(line);
@@ -2089,27 +2346,15 @@ impl Terminal {
         if full && allow_history && !self.in_alt() {
             self.normalize_region();
             for _ in 0..count {
-                let removed = self.main.pop_front().unwrap_or_else(|| self.new_line());
-                let mut replacement = None;
+                let mut line = self.main.pop_front().unwrap_or_else(|| self.new_line());
                 if self.history != 0 {
-                    self.scrollback.push_back(removed);
-                    while self.scrollback.len() > self.history {
-                        if let Some(mut evicted) = self.scrollback.pop_front() {
-                            let id = self.next_line_id();
-                            blank_in_place(&mut evicted, id);
-                            replacement = Some(evicted);
-                        }
-                    }
+                    self.scrollback.push_line(&line, self.cols, self.history);
                     if self.scroll_offset > 0 {
                         self.scroll_offset = (self.scroll_offset + 1).min(self.scrollback.len());
                     }
-                } else {
-                    let mut blank = removed;
-                    let id = self.next_line_id();
-                    blank_in_place(&mut blank, id);
-                    replacement = Some(blank);
                 }
-                let line = replacement.unwrap_or_else(|| self.new_line());
+                let id = self.next_line_id();
+                blank_in_place(&mut line, id);
                 self.main.push_back(line);
             }
         } else {
@@ -2775,6 +3020,7 @@ mod tests {
                         attrs: Attrs::default(),
                         width: 0,
                     };
+                    t.lines_mut()[0].has_wide = true;
                 }
                 for &b in &bytes {
                     slow.print(b as char);
@@ -2926,6 +3172,44 @@ mod tests {
 
         terminal.finish_deferred_resize();
         assert_eq!(terminal.scrollback_cells_len(0), 40);
+    }
+
+    #[test]
+    fn scrollback_arena_handles_blanks_eviction_and_chunk_recycling() {
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let mut terminal = Terminal::new(80, 4, 600, theme, CursorStyle::Block, false);
+        let mut parser = Parser::new();
+        // Push enough lines (> SCROLLBACK_CHUNK_CELLS = 32768 cells) with
+        // interleaved blank lines so chunks fill, evict, and recycle.
+        for i in 0..1200usize {
+            if i % 5 == 0 {
+                parser.advance(b"\r\n", &mut terminal);
+            } else {
+                let line = format!(
+                    "{i:04} 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n"
+                );
+                parser.advance(line.as_bytes(), &mut terminal);
+            }
+        }
+        assert_eq!(terminal.scrollback_len(), 600);
+        // The oldest scrollback line is around index 596..600 depending on trailing newline.
+        terminal.scroll_to_top();
+        let mut non_blank_seen = 0usize;
+        for row in 0..terminal.height() {
+            let line = terminal.visible_line(row).unwrap();
+            if line.cells.first().is_some_and(|c| c.ch != ' ') {
+                non_blank_seen += 1;
+                let prefix: String = line.cells[..4].iter().map(|c| c.ch).collect();
+                assert!(
+                    prefix.chars().all(|c| c.is_ascii_digit()),
+                    "corrupted scrollback prefix: {prefix:?}"
+                );
+            }
+        }
+        assert!(non_blank_seen > 0);
+        // Verify search finds a line inside scrollback after chunk recycling.
+        terminal.set_search_query("0901");
+        assert_eq!(terminal.search_matches().len(), 1);
     }
 
     #[test]
