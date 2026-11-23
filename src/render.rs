@@ -1,6 +1,7 @@
 //! Software text rendering with fontdb and swash. No X11 dependency.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use fontdb::{Database, Family, Query, Stretch, Style, Weight};
@@ -11,8 +12,45 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::config::{FontConfig, FontDescription};
 use crate::scrollbar;
-use crate::theme::{Rgb, Theme};
+use crate::theme::{self, Rgb, Theme};
 use crate::vt::{Attrs, Cell, Color, Terminal};
+
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut h = self.0;
+        for &byte in bytes {
+            h = (h.rotate_left(5) ^ byte as u64).wrapping_mul(K);
+        }
+        self.0 = h;
+    }
+
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.0 = (self.0.rotate_left(5) ^ value as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.0 = (self.0.rotate_left(5) ^ value as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.0 = (self.0.rotate_left(5) ^ value as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
 /// A 32-bit pixel buffer. Opaque canvases use `0x00RRGGBB`; ARGB canvases
 /// use straight-alpha `0xAARRGGBB`.
@@ -50,6 +88,22 @@ impl Canvas {
         (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
     }
 
+    fn repack_stride(&mut self, new_stride: u16, background: u32) {
+        let old_stride = self.stride as usize;
+        let target_stride = new_stride as usize;
+        let rows = self.height as usize;
+        let cols = old_stride.min(target_stride);
+        let mut pixels = vec![background; target_stride * rows];
+        for row in 0..rows {
+            let source = row * old_stride;
+            let destination = row * target_stride;
+            pixels[destination..destination + cols]
+                .copy_from_slice(&self.pixels[source..source + cols]);
+        }
+        self.pixels = pixels;
+        self.stride = new_stride;
+    }
+
     /// Grows the row stride with headroom, repacking existing rows once.
     /// Returns true when the layout changed and the whole texture must be sent.
     pub fn ensure_stride(&mut self, width: u16, background: u32) -> bool {
@@ -59,39 +113,19 @@ impl Canvas {
         let stride = width
             .saturating_add((width / 2).min(512))
             .max(width.saturating_add(64));
-        let old_stride = self.stride as usize;
-        let new_stride = stride as usize;
-        let rows = self.height as usize;
-        let mut pixels = vec![background; new_stride * rows];
-        for row in 0..rows {
-            let source = row * old_stride;
-            let destination = row * new_stride;
-            let cols = old_stride.min(new_stride);
-            pixels[destination..destination + cols]
-                .copy_from_slice(&self.pixels[source..source + cols]);
-        }
-        self.pixels = pixels;
-        self.stride = stride;
+        self.repack_stride(stride, background);
         true
     }
 
     /// Resets the stride to the visible width after a drag settles.
-    pub fn compact_stride(&mut self, background: u32) {
+    /// Returns true when the stride actually shrank.
+    pub fn compact_stride(&mut self, background: u32) -> bool {
         if self.stride == self.width {
-            return;
+            return false;
         }
-        let old_stride = self.stride as usize;
-        let new_stride = self.width as usize;
-        let rows = self.height as usize;
-        let mut pixels = vec![background; new_stride * rows];
-        for row in 0..rows {
-            let source = row * old_stride;
-            let destination = row * new_stride;
-            pixels[destination..destination + new_stride]
-                .copy_from_slice(&self.pixels[source..source + new_stride]);
-        }
-        self.pixels = pixels;
-        self.stride = self.width;
+        let width = self.width;
+        self.repack_stride(width, background);
+        true
     }
 
     pub fn resize(&mut self, width: u16, height: u16, background: u32) {
@@ -159,26 +193,59 @@ impl Canvas {
         }
     }
 
+    pub fn stroke_rect(&mut self, x: i32, y: i32, width: i32, height: i32, color: u32) {
+        self.fill_rect(x, y, width, 1, color);
+        self.fill_rect(x, y + height - 1, width, 1, color);
+        self.fill_rect(x, y, 1, height, color);
+        self.fill_rect(x + width - 1, y, 1, height, color);
+    }
+
     fn blend_mask(&mut self, x: i32, y: i32, width: u32, height: u32, data: &[u8], color: Rgb) {
         let Some((x0, y0, x1, y1)) = self.clip(x, y, width as i32, height as i32) else {
             return;
         };
         let source = rgb(color);
-        let argb = self.argb;
-        for row in y0..y1 {
-            let source_row = (row as i32 - y) as usize * width as usize;
-            let destination_row = row as usize * self.stride as usize;
-            for col in x0..x1 {
-                let alpha = data[source_row + (col as i32 - x) as usize] as u32;
-                if alpha == 0 {
-                    continue;
+        let stride = self.stride as usize;
+        let width = width as usize;
+        let col_offset = (x0 as i32 - x) as usize;
+        let count = (x1 - x0) as usize;
+        if self.argb {
+            let opaque = 0xff00_0000 | source;
+            for row in y0..y1 {
+                let source_start = (row as i32 - y) as usize * width + col_offset;
+                let dest_start = row as usize * stride + x0 as usize;
+                let src = &data[source_start..source_start + count];
+                let dst = &mut self.pixels[dest_start..dest_start + count];
+                for (pixel, &alpha) in dst.iter_mut().zip(src) {
+                    if alpha == 0 {
+                        continue;
+                    }
+                    if alpha == 255 {
+                        *pixel = opaque;
+                    } else {
+                        *pixel = blend_alpha(*pixel, source, alpha as u32);
+                    }
                 }
-                let index = destination_row + col as usize;
-                self.pixels[index] = if argb {
-                    blend_alpha(self.pixels[index], source, alpha)
-                } else {
-                    blend(self.pixels[index], source, alpha)
-                };
+            }
+        } else {
+            let sr = color[0] as u32;
+            let sg = color[1] as u32;
+            let sb = color[2] as u32;
+            for row in y0..y1 {
+                let source_start = (row as i32 - y) as usize * width + col_offset;
+                let dest_start = row as usize * stride + x0 as usize;
+                let src = &data[source_start..source_start + count];
+                let dst = &mut self.pixels[dest_start..dest_start + count];
+                for (pixel, &alpha) in dst.iter_mut().zip(src) {
+                    if alpha == 0 {
+                        continue;
+                    }
+                    if alpha == 255 {
+                        *pixel = source;
+                    } else {
+                        *pixel = blend_rgb(*pixel, sr, sg, sb, alpha as u32);
+                    }
+                }
             }
         }
     }
@@ -187,47 +254,68 @@ impl Canvas {
         let Some((x0, y0, x1, y1)) = self.clip(x, y, width as i32, height as i32) else {
             return;
         };
-        let argb = self.argb;
-        for row in y0..y1 {
-            let source_row = (row as i32 - y) as usize * width as usize;
-            let destination_row = row as usize * self.stride as usize;
-            for col in x0..x1 {
-                let source_index = (source_row + (col as i32 - x) as usize) * 4;
-                let alpha = data[source_index + 3] as u32;
-                if alpha == 0 {
-                    continue;
+        let stride = self.stride as usize;
+        let width = width as usize;
+        let col_offset = (x0 as i32 - x) as usize;
+        let count = (x1 - x0) as usize;
+        if self.argb {
+            for row in y0..y1 {
+                let source_start = ((row as i32 - y) as usize * width + col_offset) * 4;
+                let dest_start = row as usize * stride + x0 as usize;
+                let dst = &mut self.pixels[dest_start..dest_start + count];
+                for (offset, pixel) in dst.iter_mut().enumerate() {
+                    let i = source_start + offset * 4;
+                    let alpha = data[i + 3] as u32;
+                    if alpha == 0 {
+                        continue;
+                    }
+                    let source = rgb([data[i], data[i + 1], data[i + 2]]);
+                    *pixel = blend_alpha(*pixel, source, alpha);
                 }
-                let color = [
-                    data[source_index],
-                    data[source_index + 1],
-                    data[source_index + 2],
-                ];
-                let index = destination_row + col as usize;
-                self.pixels[index] = if argb {
-                    blend_alpha(self.pixels[index], rgb(color), alpha)
-                } else {
-                    blend(self.pixels[index], rgb(color), alpha)
-                };
+            }
+        } else {
+            for row in y0..y1 {
+                let source_start = ((row as i32 - y) as usize * width + col_offset) * 4;
+                let dest_start = row as usize * stride + x0 as usize;
+                let dst = &mut self.pixels[dest_start..dest_start + count];
+                for (offset, pixel) in dst.iter_mut().enumerate() {
+                    let i = source_start + offset * 4;
+                    let alpha = data[i + 3] as u32;
+                    if alpha == 0 {
+                        continue;
+                    }
+                    let source = rgb([data[i], data[i + 1], data[i + 2]]);
+                    *pixel = blend(*pixel, source, alpha);
+                }
             }
         }
     }
 }
 
-fn blend(destination: u32, source: u32, alpha: u32) -> u32 {
-    if alpha == 255 {
-        return source;
-    }
+#[inline]
+fn blend_rgb(destination: u32, source_r: u32, source_g: u32, source_b: u32, alpha: u32) -> u32 {
     let destination_r = (destination >> 16) & 0xff;
     let destination_g = (destination >> 8) & 0xff;
     let destination_b = destination & 0xff;
-    let source_r = (source >> 16) & 0xff;
-    let source_g = (source >> 8) & 0xff;
-    let source_b = source & 0xff;
     let inverse = 255 - alpha;
     let red = (source_r * alpha + destination_r * inverse) / 255;
     let green = (source_g * alpha + destination_g * inverse) / 255;
     let blue = (source_b * alpha + destination_b * inverse) / 255;
     (red << 16) | (green << 8) | blue
+}
+
+#[inline]
+fn blend(destination: u32, source: u32, alpha: u32) -> u32 {
+    if alpha == 255 {
+        return source;
+    }
+    blend_rgb(
+        destination,
+        (source >> 16) & 0xff,
+        (source >> 8) & 0xff,
+        source & 0xff,
+        alpha,
+    )
 }
 
 pub fn rgb(color: Rgb) -> u32 {
@@ -255,14 +343,24 @@ pub fn pixel(canvas: &Canvas, color: Rgb, alpha: u8) -> u32 {
     }
 }
 
+#[inline]
 fn blend_alpha(destination: u32, source: u32, alpha: u32) -> u32 {
-    // Fully covered pixels are by far the most common in a glyph mask; they
-    // need no division. A fully transparent destination is the other case
-    // where the general formula collapses exactly.
+    // Fully covered pixels, opaque destinations (the common case on an ARGB
+    // visual with opacity 1.0), and fully transparent destinations all avoid
+    // variable-denominator division.
     if alpha == 255 {
         return 0xff00_0000 | (source & 0x00ff_ffff);
     }
     let destination_alpha = destination >> 24;
+    if destination_alpha == 255 {
+        let inverse = 255 - alpha;
+        let red =
+            (((source >> 16) & 0xff) * alpha + ((destination >> 16) & 0xff) * inverse + 127) / 255;
+        let green =
+            (((source >> 8) & 0xff) * alpha + ((destination >> 8) & 0xff) * inverse + 127) / 255;
+        let blue = ((source & 0xff) * alpha + (destination & 0xff) * inverse + 127) / 255;
+        return 0xff00_0000 | (red << 16) | (green << 8) | blue;
+    }
     if destination_alpha == 0 {
         return (alpha << 24) | (source & 0x00ff_ffff);
     }
@@ -320,6 +418,8 @@ struct GlyphRef {
     glyph: u16,
 }
 
+const ASCII_CACHE_LEN: usize = 96 * 4;
+
 pub struct Renderer {
     cell_width: u16,
     cell_height: u16,
@@ -337,8 +437,9 @@ pub struct Renderer {
     database: Arc<Database>,
     fallback_families: Vec<String>,
     loaded_families: HashMap<String, Option<u32>>,
-    glyph_cache: HashMap<GlyphKey, Option<GlyphBitmap>>,
-    fallback_cache: HashMap<(char, u8), Option<GlyphRef>>,
+    ascii_glyphs: [Option<Option<GlyphRef>>; ASCII_CACHE_LEN],
+    glyph_cache: FastMap<GlyphKey, Option<GlyphBitmap>>,
+    fallback_cache: FastMap<(char, u8), Option<GlyphRef>>,
     scale_context: ScaleContext,
 }
 
@@ -375,6 +476,7 @@ impl Renderer {
             config.bold.as_ref(),
             Weight::BOLD,
             Style::Normal,
+            regular_id,
             &regular,
         );
         let italic = load_style(
@@ -383,6 +485,7 @@ impl Renderer {
             config.italic.as_ref(),
             Weight::NORMAL,
             Style::Italic,
+            regular_id,
             &regular,
         );
         let bold_italic = load_style(
@@ -391,6 +494,7 @@ impl Renderer {
             config.bold_italic.as_ref(),
             Weight::BOLD,
             Style::Italic,
+            regular_id,
             &regular,
         );
 
@@ -452,8 +556,9 @@ impl Renderer {
             database,
             fallback_families,
             loaded_families: HashMap::new(),
-            glyph_cache: HashMap::new(),
-            fallback_cache: HashMap::new(),
+            ascii_glyphs: [None; ASCII_CACHE_LEN],
+            glyph_cache: FastMap::default(),
+            fallback_cache: FastMap::default(),
             scale_context: ScaleContext::new(),
         };
         renderer.remember_primary_families(config);
@@ -526,6 +631,7 @@ impl Renderer {
         let has_selection = terminal.has_selection();
         let search = terminal.search_matches();
         let search_current = terminal.search_current();
+        let mut search_cursor = 0usize;
         for row in 0..rows {
             if !damage.all && !damage.rows.get(row).copied().unwrap_or(false) {
                 continue;
@@ -533,12 +639,14 @@ impl Renderer {
             let Some(line) = terminal.visible_line(row) else {
                 continue;
             };
-            let highlights: Vec<(usize, usize, bool)> = search
-                .iter()
-                .enumerate()
-                .filter(|(_, item)| item.line == line.id)
-                .map(|(index, item)| (item.start, item.end, Some(index) == search_current))
-                .collect();
+            while search_cursor < search.len() && search[search_cursor].line < line.id {
+                search_cursor += 1;
+            }
+            let match_start = search_cursor;
+            while search_cursor < search.len() && search[search_cursor].line == line.id {
+                search_cursor += 1;
+            }
+            let line_matches = &search[match_start..search_cursor];
             let y0 = origin_y + row as i32 * cell_h;
             if !damage.all {
                 canvas.fill_rect(
@@ -549,6 +657,7 @@ impl Renderer {
                     background,
                 );
             }
+            let mut match_index = 0usize;
             for col in 0..terminal.width() {
                 let Some(cell) = line.cells.get(col) else {
                     break;
@@ -559,20 +668,22 @@ impl Renderer {
                 // The row fill already painted default-background blanks with
                 // no attributes; redrawing them only repeats work.
                 if cell.ch == ' '
-                    && cell.extra == 0
-                    && cell.link == 0
+                    && cell.meta == 0
                     && cell.bg == Color::Default
                     && cell.attrs == Attrs::default()
                     && !has_selection
-                    && highlights.is_empty()
+                    && line_matches.is_empty()
                 {
                     continue;
                 }
                 let selected = has_selection && terminal.is_selected(line.id, col);
-                let highlight = highlights
-                    .iter()
-                    .find(|(start, end, _)| col >= *start && col <= *end)
-                    .map(|(_, _, current)| *current);
+                while match_index < line_matches.len() && line_matches[match_index].end < col {
+                    match_index += 1;
+                }
+                let highlight = line_matches.get(match_index).and_then(|item| {
+                    (col >= item.start && col <= item.end)
+                        .then_some(Some(match_start + match_index) == search_current)
+                });
                 self.draw_cell(
                     canvas,
                     terminal,
@@ -581,6 +692,7 @@ impl Renderer {
                     y0,
                     selected,
                     highlight,
+                    background,
                     background_alpha,
                 );
             }
@@ -630,7 +742,7 @@ impl Renderer {
                             canvas.fill_rect(x, y, cell_w, cell_h, cursor_color);
                             self.draw_text(canvas, terminal, cell, x, y, theme.cursor_text);
                         } else {
-                            outline(canvas, x, y, cell_w, cell_h, cursor_color);
+                            canvas.stroke_rect(x, y, cell_w, cell_h, cursor_color);
                         }
                     }
                     crate::vt::CursorStyle::Beam => {
@@ -660,6 +772,7 @@ impl Renderer {
         y: i32,
         selected: bool,
         highlight: Option<bool>,
+        row_background: u32,
         background_alpha: u8,
     ) {
         let theme = terminal.theme();
@@ -695,12 +808,14 @@ impl Renderer {
         } else {
             rgb(bg)
         };
-        let foreground = if canvas.argb { argb(fg, 255) } else { rgb(fg) };
-        canvas.fill_rect(x, y, width, height, background);
+        if background != row_background {
+            canvas.fill_rect(x, y, width, height, background);
+        }
+        let foreground = pixel(canvas, fg, 255);
 
         let underline_y = y + (self.baseline + self.underline_offset).round() as i32;
         let stroke = self.stroke_size.round().max(1.0) as i32;
-        if attrs.contains(Attrs::UNDERLINE) || cell.link != 0 {
+        if attrs.contains(Attrs::UNDERLINE) || terminal.cell_has_link(cell) {
             canvas.fill_rect(x, underline_y, width, stroke, foreground);
         }
         if attrs.contains(Attrs::DOUBLE_UNDERLINE) {
@@ -727,11 +842,8 @@ impl Renderer {
         color: Rgb,
     ) {
         let style = style_index(cell.attrs);
-        // Most cells are a single char. Avoid a per-cell String allocation by
-        // keeping the common case on the stack and only building a combined
-        // buffer for grapheme clusters with trailing combining marks.
-        let extra = if cell.extra != 0 {
-            terminal.extra_text(cell.extra)
+        let extra = if cell.meta != 0 {
+            terminal.cell_extra(cell)
         } else {
             None
         };
@@ -747,27 +859,77 @@ impl Renderer {
                 _ => (0, 0),
             };
             if height > 0 {
-                let solid = if canvas.argb {
-                    argb(color, 255)
-                } else {
-                    rgb(color)
-                };
+                let solid = pixel(canvas, color, 255);
                 canvas.fill_rect(x, y + oy, self.cell_width as i32, height, solid);
                 return;
             }
+            let baseline = y as f32 + self.baseline;
+            let glyph_offset_x = self.glyph_offset_x.round() as i32;
+            let glyph_offset_y = self.glyph_offset_y.round() as i32;
+            self.draw_char(
+                canvas,
+                cell.ch,
+                cell.width as usize,
+                x,
+                y,
+                baseline,
+                glyph_offset_x,
+                glyph_offset_y,
+                color,
+                style,
+            );
+            return;
         }
-        let mut stack = [0u8; 8];
-        let text: &str = match extra {
-            None => cell.ch.encode_utf8(&mut stack),
-            Some(extra) => {
-                let mut combined = String::with_capacity(cell.ch.len_utf8() + extra.len());
-                combined.push(cell.ch);
-                combined.push_str(extra);
-                // Borrow from a local that outlives the loop below.
-                return self.draw_text_str(canvas, &combined, x, y, color, style);
+        if let Some(extra) = extra {
+            let mut combined = String::with_capacity(cell.ch.len_utf8() + extra.len());
+            combined.push(cell.ch);
+            combined.push_str(extra);
+            self.draw_text_str(canvas, &combined, x, y, color, style);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_char(
+        &mut self,
+        canvas: &mut Canvas,
+        ch: char,
+        width: usize,
+        pen_x: i32,
+        y: i32,
+        baseline: f32,
+        glyph_offset_x: i32,
+        glyph_offset_y: i32,
+        color: Rgb,
+        style: u8,
+    ) {
+        if ch == '\u{200d}' || (0xfe00..=0xfe0f).contains(&(ch as u32)) {
+            return;
+        }
+        let Some(glyph) = self.resolve_glyph(ch, style) else {
+            if width > 0 {
+                missing_glyph(
+                    canvas,
+                    pen_x,
+                    y,
+                    self.cell_width as i32,
+                    self.cell_height as i32,
+                    pixel(canvas, color, 255),
+                );
             }
+            return;
         };
-        self.draw_text_str(canvas, text, x, y, color, style)
+        if let Some(bitmap) = self.rasterize(glyph) {
+            let gx = pen_x + bitmap.left + glyph_offset_x;
+            let gy = (baseline - bitmap.top as f32).round() as i32 + glyph_offset_y;
+            match bitmap.content {
+                Content::Color => {
+                    canvas.blend_rgba(gx, gy, bitmap.width, bitmap.height, &bitmap.data);
+                }
+                _ => {
+                    canvas.blend_mask(gx, gy, bitmap.width, bitmap.height, &bitmap.data, color);
+                }
+            }
+        }
     }
 
     fn draw_text_str(
@@ -785,47 +947,35 @@ impl Renderer {
         let mut pen_x = x;
         for ch in text.chars() {
             let width = ch.width().unwrap_or(0);
-            if ch == '\u{200d}' || (0xfe00..=0xfe0f).contains(&(ch as u32)) {
-                continue;
-            }
-            let Some(glyph) = self.resolve_glyph(ch, style) else {
-                if width > 0 {
-                    missing_glyph(
-                        canvas,
-                        pen_x,
-                        y,
-                        self.cell_width as i32,
-                        self.cell_height as i32,
-                        if canvas.argb {
-                            argb(color, 255)
-                        } else {
-                            rgb(color)
-                        },
-                    );
-                }
-                pen_x += width.min(2) as i32 * self.cell_width as i32;
-                continue;
-            };
-            if let Some(bitmap) = self.rasterize(glyph) {
-                let gx = pen_x + bitmap.left + glyph_offset_x;
-                let gy = (baseline - bitmap.top as f32).round() as i32 + glyph_offset_y;
-                match bitmap.content {
-                    Content::Color => {
-                        canvas.blend_rgba(gx, gy, bitmap.width, bitmap.height, &bitmap.data);
-                    }
-                    _ => {
-                        canvas.blend_mask(gx, gy, bitmap.width, bitmap.height, &bitmap.data, color);
-                    }
-                }
-            }
+            self.draw_char(
+                canvas,
+                ch,
+                width,
+                pen_x,
+                y,
+                baseline,
+                glyph_offset_x,
+                glyph_offset_y,
+                color,
+                style,
+            );
             pen_x += width.min(2) as i32 * self.cell_width as i32;
         }
     }
 
     fn resolve_glyph(&mut self, ch: char, style: u8) -> Option<GlyphRef> {
-        if let Some(cached) = self.fallback_cache.get(&(ch, style)) {
-            return *cached;
-        }
+        let ascii_slot = if (' '..='\x7f').contains(&ch) {
+            let slot = (style as usize) * 96 + (ch as usize - 0x20);
+            if let Some(cached) = self.ascii_glyphs[slot] {
+                return cached;
+            }
+            Some(slot)
+        } else {
+            if let Some(cached) = self.fallback_cache.get(&(ch, style)) {
+                return *cached;
+            }
+            None
+        };
         let mut found = None;
         let primary = self.primary[style as usize];
         if let Some(glyph) = glyph_in_font(&self.fonts[primary], ch) {
@@ -835,9 +985,8 @@ impl Renderer {
             });
         }
         if found.is_none() {
-            let families = self.fallback_families.clone();
-            for family in families {
-                let Some(font_index) = self.load_family(&family) else {
+            for index in 0..self.fallback_families.len() {
+                let Some(font_index) = self.load_family_at(index) else {
                     continue;
                 };
                 if let Some(glyph) = glyph_in_font(&self.fonts[font_index as usize], ch) {
@@ -849,15 +998,20 @@ impl Renderer {
                 }
             }
         }
-        self.fallback_cache.insert((ch, style), found);
+        if let Some(slot) = ascii_slot {
+            self.ascii_glyphs[slot] = Some(found);
+        } else {
+            self.fallback_cache.insert((ch, style), found);
+        }
         found
     }
 
-    fn load_family(&mut self, family: &str) -> Option<u32> {
-        let key = family.to_ascii_lowercase();
+    fn load_family_at(&mut self, index: usize) -> Option<u32> {
+        let key = self.fallback_families[index].to_ascii_lowercase();
         if let Some(value) = self.loaded_families.get(&key) {
             return *value;
         }
+        let family = &self.fallback_families[index];
         let query = Query {
             families: &[family_value(family)],
             weight: Weight::NORMAL,
@@ -1020,23 +1174,23 @@ fn load_style(
     override_desc: Option<&FontDescription>,
     weight: Weight,
     style: Style,
+    regular_id: fontdb::ID,
     regular: &LoadedFont,
 ) -> LoadedFont {
     let description = override_desc.unwrap_or(normal);
-    let id = query_face(database, description, weight, style);
-    let Some(id) = id else {
-        return LoadedFont {
-            data: regular.data.clone(),
-            index: regular.index,
-            synthetic_bold: weight.0 > face_weight(regular),
-        };
+    let fallback = || LoadedFont {
+        data: regular.data.clone(),
+        index: regular.index,
+        synthetic_bold: weight.0 > face_weight(regular),
     };
+    let Some(id) = query_face(database, description, weight, style) else {
+        return fallback();
+    };
+    if id == regular_id {
+        return fallback();
+    }
     let Ok((data, index)) = face_data(database, id) else {
-        return LoadedFont {
-            data: regular.data.clone(),
-            index: regular.index,
-            synthetic_bold: weight.0 > face_weight(regular),
-        };
+        return fallback();
     };
     let loaded = LoadedFont {
         data: Arc::new(data),
@@ -1103,15 +1257,12 @@ fn resolve_color(terminal: &Terminal, color: Color, foreground: bool, attrs: Att
             };
             palette[index as usize]
         }
-        Color::Rgb(mut rgb) => {
+        Color::Rgb(rgb) => {
             if dim {
-                rgb = [
-                    (rgb[0] as u16 * 2 / 3) as u8,
-                    (rgb[1] as u16 * 2 / 3) as u8,
-                    (rgb[2] as u16 * 2 / 3) as u8,
-                ];
+                theme::dim(rgb)
+            } else {
+                rgb
             }
-            rgb
         }
     }
 }
@@ -1121,10 +1272,7 @@ fn missing_glyph(canvas: &mut Canvas, x: i32, y: i32, width: i32, height: i32, c
     let right = x + width - width / 4;
     let top = y + height / 4;
     let bottom = y + height - height / 4;
-    canvas.fill_rect(left, top, right - left, 1, color);
-    canvas.fill_rect(left, bottom, right - left, 1, color);
-    canvas.fill_rect(left, top, 1, bottom - top, color);
-    canvas.fill_rect(right - 1, top, 1, bottom - top, color);
+    canvas.stroke_rect(left, top, right - left, bottom - top + 1, color);
 }
 
 fn search_background(theme: &Theme, current: bool) -> Rgb {
@@ -1142,13 +1290,6 @@ fn readable_on(color: Rgb) -> Rgb {
     } else {
         [255, 255, 255]
     }
-}
-
-fn outline(canvas: &mut Canvas, x: i32, y: i32, width: i32, height: i32, color: u32) {
-    canvas.fill_rect(x, y, width, 1, color);
-    canvas.fill_rect(x, y + height - 1, width, 1, color);
-    canvas.fill_rect(x, y, 1, height, color);
-    canvas.fill_rect(x + width - 1, y, 1, height, color);
 }
 
 #[cfg(test)]
@@ -1189,10 +1330,31 @@ mod tests {
         assert_eq!(&canvas.pixels[0..2], &[10, 11]);
         assert_eq!(&canvas.pixels[stride..stride + 2], &[13, 14]);
 
-        canvas.compact_stride(77);
+        assert!(canvas.compact_stride(77));
+        assert!(!canvas.compact_stride(77));
         assert_eq!(canvas.stride, canvas.width);
         assert_eq!(&canvas.pixels[0..2], &[10, 11]);
         assert_eq!(&canvas.pixels[2..4], &[13, 14]);
+    }
+
+    #[test]
+    fn opaque_destination_alpha_blend_matches_general_formula() {
+        for alpha in 1..255u32 {
+            let dst = 0xff20_4080;
+            let src = 0x00e0_9030;
+            let fast = blend_alpha(dst, src, alpha);
+            let inv = 255 - alpha;
+            let denom = alpha * 255 + 255 * inv;
+            let r =
+                (((src >> 16) & 0xff) * alpha * 255 + ((dst >> 16) & 0xff) * 255 * inv + denom / 2)
+                    / denom;
+            let g =
+                (((src >> 8) & 0xff) * alpha * 255 + ((dst >> 8) & 0xff) * 255 * inv + denom / 2)
+                    / denom;
+            let b = ((src & 0xff) * alpha * 255 + (dst & 0xff) * 255 * inv + denom / 2) / denom;
+            let exact = 0xff00_0000 | (r << 16) | (g << 8) | b;
+            assert_eq!(fast, exact, "alpha={alpha}");
+        }
     }
 
     #[test]

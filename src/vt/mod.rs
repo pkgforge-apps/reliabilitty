@@ -59,6 +59,7 @@ pub struct Pen {
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attrs,
+    /// Packed `Cell::meta` for the active hyperlink (0 when no link is active).
     pub link: u32,
 }
 
@@ -73,17 +74,23 @@ impl Default for Pen {
     }
 }
 
+/// Tag bits for `Cell::meta`. Zero means neither combining text nor hyperlink.
+const META_LINK_BIT: u32 = 1 << 31;
+const META_BOTH_BIT: u32 = 1 << 30;
+const META_INDEX_MASK: u32 = !(META_LINK_BIT | META_BOTH_BIT);
+
 /// One character cell. Wide characters occupy a cell of width two followed by
 /// a continuation cell of width zero.
 #[derive(Clone, Copy, Debug)]
 pub struct Cell {
     pub ch: char,
-    pub extra: u32,
+    /// Packed side-table handle for combining marks and/or OSC 8 links.
+    /// Zero means neither; bit 31 = link id, bit 30 = combined (extra, link)
+    /// entry, otherwise 1-based extra text id.
+    pub meta: u32,
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attrs,
-    /// One-based index into the terminal's OSC 8 link targets; zero is none.
-    pub link: u32,
     /// Display width: zero for a continuation, one or two for a base.
     pub width: u8,
 }
@@ -92,17 +99,16 @@ impl Cell {
     pub fn blank() -> Self {
         Self {
             ch: ' ',
-            extra: 0,
+            meta: 0,
             fg: Color::Default,
             bg: Color::Default,
             attrs: Attrs::default(),
-            link: 0,
             width: 1,
         }
     }
 
     pub fn is_blank(&self) -> bool {
-        self.ch == ' ' && self.extra == 0 && self.width != 0
+        self.ch == ' ' && (self.meta == 0 || self.meta & META_LINK_BIT != 0) && self.width != 0
     }
 }
 
@@ -168,6 +174,46 @@ impl Line {
         self.written_min = usize::MAX;
         self.written_max = 0;
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Blanks the untouched partner of any wide character overlapped at `x`
+    /// (for a single-column overwrite) and extends `written_min..=written_max`
+    /// if a neighbour outside the overwritten column was cleared.
+    #[inline]
+    fn clear_wide_at(&mut self, x: usize) {
+        let old = self.cells[x];
+        if old.width == 0 {
+            if x > 0 && self.cells[x - 1].width == 2 {
+                let bg = self.cells[x - 1].bg;
+                self.cells[x - 1] = Cell {
+                    bg,
+                    ..Cell::blank()
+                };
+                self.mark_written(x - 1);
+            }
+        } else if old.width == 2 && x + 1 < self.cells.len() {
+            let bg = self.cells[x + 1].bg;
+            self.cells[x + 1] = Cell {
+                bg,
+                ..Cell::blank()
+            };
+            self.mark_written(x + 1);
+        }
+    }
+
+    #[inline]
+    fn write_ascii(&mut self, x: usize, byte: u8, fg: Color, bg: Color, attrs: Attrs, meta: u32) {
+        if self.cells[x].width != 1 {
+            self.clear_wide_at(x);
+        }
+        self.cells[x] = Cell {
+            ch: byte as char,
+            meta,
+            fg,
+            bg,
+            attrs,
+            width: 1,
+        };
     }
 }
 
@@ -381,8 +427,12 @@ pub struct Terminal {
     extras_map: HashMap<Box<str>, u32>,
     /// Scrollback lines need reflowing after a width change.
     pending_scrollback_resize: bool,
-    /// OSC 8 hyperlink targets, one-based so zero in a Cell means no link.
+    /// OSC 8 hyperlink targets, one-based so zero means no link.
     link_targets: Vec<Box<str>>,
+    link_targets_map: HashMap<Box<str>, u32>,
+    /// Side table for cells that carry both combining text and a hyperlink.
+    meta_pairs: Vec<(u32, u32)>,
+    meta_pairs_map: HashMap<(u32, u32), u32>,
     active_link: u32,
     last_printed: Option<(usize, usize)>,
     wrap_pending: bool,
@@ -464,6 +514,9 @@ impl Terminal {
             extras_map: HashMap::new(),
             pending_scrollback_resize: false,
             link_targets: Vec::new(),
+            link_targets_map: HashMap::new(),
+            meta_pairs: Vec::new(),
+            meta_pairs_map: HashMap::new(),
             active_link: 0,
             last_printed: None,
             wrap_pending: false,
@@ -639,6 +692,13 @@ impl Terminal {
         self.region_offset = 0;
     }
 
+    fn find_line(&self, id: u64) -> Option<&Line> {
+        self.lines()
+            .iter()
+            .chain(self.scrollback.iter())
+            .find(|line| line.id == id)
+    }
+
     fn all_lines(&self) -> Vec<&Line> {
         let active = self.lines();
         let mut lines = Vec::with_capacity(self.scrollback.len() + active.len());
@@ -683,24 +743,65 @@ impl Terminal {
         Some(Anchor { line: line.id, col })
     }
 
-    pub fn extra_text(&self, id: u32) -> Option<&str> {
-        self.extras.get(id as usize - 1).map(|text| &**text)
+    fn unpack_meta(&self, meta: u32) -> (u32, u32) {
+        if meta == 0 {
+            (0, 0)
+        } else if meta & META_LINK_BIT != 0 {
+            (0, meta & META_INDEX_MASK)
+        } else if meta & META_BOTH_BIT != 0 {
+            self.meta_pairs
+                .get((meta & META_INDEX_MASK) as usize)
+                .copied()
+                .unwrap_or((0, 0))
+        } else {
+            (meta, 0)
+        }
+    }
+
+    fn pack_meta(&mut self, extra: u32, link: u32) -> u32 {
+        match (extra, link) {
+            (0, 0) => 0,
+            (e, 0) => e,
+            (0, l) => META_LINK_BIT | l,
+            (e, l) => {
+                if let Some(&index) = self.meta_pairs_map.get(&(e, l)) {
+                    META_BOTH_BIT | index
+                } else {
+                    let index = self.meta_pairs.len() as u32;
+                    self.meta_pairs.push((e, l));
+                    self.meta_pairs_map.insert((e, l), index);
+                    META_BOTH_BIT | index
+                }
+            }
+        }
+    }
+
+    pub fn cell_extra(&self, cell: Cell) -> Option<&str> {
+        let (extra, _) = self.unpack_meta(cell.meta);
+        if extra == 0 {
+            None
+        } else {
+            self.extras.get(extra as usize - 1).map(|text| &**text)
+        }
+    }
+
+    pub fn cell_has_link(&self, cell: Cell) -> bool {
+        cell.meta != 0 && self.unpack_meta(cell.meta).1 != 0
     }
 
     /// Starts an OSC 8 hyperlink, reusing an existing target id if the URI is
     /// identical. Returns the one-based id stored in cells.
     pub fn set_link(&mut self, target: &str) -> u32 {
-        if let Some(index) = self
-            .link_targets
-            .iter()
-            .position(|existing| &**existing == target)
-        {
-            self.active_link = index as u32 + 1;
+        if let Some(&id) = self.link_targets_map.get(target) {
+            self.active_link = id;
         } else {
-            self.link_targets.push(target.into());
-            self.active_link = self.link_targets.len() as u32;
+            let boxed: Box<str> = target.into();
+            let id = self.link_targets.len() as u32 + 1;
+            self.link_targets.push(boxed.clone());
+            self.link_targets_map.insert(boxed, id);
+            self.active_link = id;
         }
-        self.pen.link = self.active_link;
+        self.pen.link = META_LINK_BIT | self.active_link;
         self.active_link
     }
 
@@ -719,7 +820,7 @@ impl Terminal {
         while col > 0 && line.cells.get(col).is_some_and(|cell| cell.width == 0) {
             col -= 1;
         }
-        let id = line.cells.get(col)?.link;
+        let (_, id) = self.unpack_meta(line.cells.get(col)?.meta);
         self.link_target(id)
     }
 
@@ -789,9 +890,7 @@ impl Terminal {
                     continue;
                 }
                 text.push(cell.ch);
-                if cell.extra != 0
-                    && let Some(extra) = self.extras.get(cell.extra as usize - 1)
-                {
+                if let Some(extra) = self.cell_extra(*cell) {
                     text.push_str(extra);
                 }
             }
@@ -813,12 +912,8 @@ impl Terminal {
                 (from, to)
             }
             SelectionMode::Line => {
-                let line = self
-                    .lines()
-                    .iter()
-                    .chain(self.scrollback.iter())
-                    .find(|line| line.id == anchor.line);
-                let last = line
+                let last = self
+                    .find_line(anchor.line)
                     .map(|line| line.cells.len().saturating_sub(1))
                     .unwrap_or(0);
                 (
@@ -848,11 +943,8 @@ impl Terminal {
             SelectionMode::Char => anchor,
             SelectionMode::Word => self.word_bounds(anchor).1,
             SelectionMode::Line => {
-                let line = self
-                    .all_lines()
-                    .into_iter()
-                    .find(|line| line.id == anchor.line);
-                let last = line
+                let last = self
+                    .find_line(anchor.line)
                     .map(|line| line.cells.len().saturating_sub(1))
                     .unwrap_or(0);
                 Anchor {
@@ -896,16 +988,19 @@ impl Terminal {
         }
     }
 
-    /// Replaces the search text and selects the nearest match at or below the
-    /// top of the current view, or the last match above it when none is below.
-    /// An empty query clears every highlight.
-    pub fn set_search_query(&mut self, query: &str) {
-        let lines = self.search_lines();
-        let needle = folded_query(query);
+    fn collect_search_matches(
+        &self,
+        lines: &[&Line],
+        needle: &[char],
+        mut old_cache: HashMap<u64, CachedLine>,
+    ) -> (Vec<(usize, SearchMatch)>, HashMap<u64, CachedLine>) {
         let mut cache = HashMap::with_capacity(lines.len());
         let mut indexed = Vec::new();
         for (index, line) in lines.iter().enumerate() {
-            let line_matches = self.scan_line(line, &needle);
+            let line_matches = match old_cache.remove(&line.id) {
+                Some(cached) if cached.revision == line.revision => cached.matches,
+                _ => self.scan_line(line, needle),
+            };
             for item in &line_matches {
                 indexed.push((index, *item));
             }
@@ -917,6 +1012,16 @@ impl Terminal {
                 },
             );
         }
+        (indexed, cache)
+    }
+
+    /// Replaces the search text and selects the nearest match at or below the
+    /// top of the current view, or the last match above it when none is below.
+    /// An empty query clears every highlight.
+    pub fn set_search_query(&mut self, query: &str) {
+        let lines = self.search_lines();
+        let needle = folded_query(query);
+        let (indexed, cache) = self.collect_search_matches(&lines, &needle, HashMap::new());
         let top = self
             .visible_line(0)
             .and_then(|line| lines.iter().position(|item| item.id == line.id))
@@ -952,23 +1057,8 @@ impl Terminal {
         };
         let lines = self.search_lines();
         let needle = folded_query(query);
-        let mut old_cache = state.lines;
-        let mut cache = HashMap::with_capacity(lines.len());
-        let mut matches = Vec::new();
-        for line in &lines {
-            let line_matches = match old_cache.remove(&line.id) {
-                Some(cached) if cached.revision == line.revision => cached.matches,
-                _ => self.scan_line(line, &needle),
-            };
-            matches.extend(line_matches.iter().copied());
-            cache.insert(
-                line.id,
-                CachedLine {
-                    revision: line.revision,
-                    matches: line_matches,
-                },
-            );
-        }
+        let (indexed, cache) = self.collect_search_matches(&lines, &needle, state.lines);
+        let matches: Vec<SearchMatch> = indexed.into_iter().map(|(_, item)| item).collect();
         let previous = state.matches.get(state.current).copied();
         let changed = matches != state.matches;
         let current = previous
@@ -1066,7 +1156,7 @@ impl Terminal {
         let end = line
             .cells
             .iter()
-            .rposition(|cell| cell.width != 0 && (cell.ch != ' ' || cell.extra != 0))
+            .rposition(|cell| !cell.is_blank() && cell.width != 0)
             .map_or(0, |index| index + 1);
         let mut chars = Vec::with_capacity(end);
         let mut columns = Vec::with_capacity(end);
@@ -1076,9 +1166,7 @@ impl Terminal {
             }
             chars.push(fold_search_char(cell.ch));
             columns.push(column);
-            if cell.extra != 0
-                && let Some(extra) = self.extras.get(cell.extra as usize - 1)
-            {
+            if let Some(extra) = self.cell_extra(*cell) {
                 for ch in extra.chars() {
                     chars.push(fold_search_char(ch));
                     columns.push(column);
@@ -1120,11 +1208,7 @@ impl Terminal {
     }
 
     fn word_bounds(&self, anchor: Anchor) -> (Anchor, Anchor) {
-        let Some(line) = self
-            .all_lines()
-            .into_iter()
-            .find(|line| line.id == anchor.line)
-        else {
+        let Some(line) = self.find_line(anchor.line) else {
             return (anchor, anchor);
         };
         let mut from = anchor.col.min(line.cells.len().saturating_sub(1));
@@ -1483,16 +1567,15 @@ impl Terminal {
         {
             let y = self.cursor.y;
             let x = self.cursor.x;
-            let (fg, bg, attrs, link) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
+            let (fg, bg, attrs, meta) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
             let line = self.line_mut(y);
             if line.cells[x].width == 1 {
                 line.cells[x] = Cell {
                     ch,
-                    extra: 0,
+                    meta,
                     fg,
                     bg,
                     attrs,
-                    link,
                     width: 1,
                 };
                 line.mark_written_range(x, x);
@@ -1532,38 +1615,31 @@ impl Terminal {
         let y = self.cursor.y;
         let x = self.cursor.x;
         let cols = self.cols;
-        let (fg, bg, attrs, link) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
+        let (fg, bg, attrs, meta) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
         let cell = Cell {
             ch,
-            extra: 0,
+            meta,
             fg,
             bg,
             attrs,
-            link,
             width: width as u8,
         };
         let line = self.line_mut(y);
         // Only neighbours outside the cells we overwrite need cleaning up.
-        let old = line.cells[x];
-        let old_next = line.cells.get(x + 1).copied();
-        if old.width == 0 && x > 0 && line.cells[x - 1].width == 2 {
-            let previous = line.cells[x - 1];
-            line.cells[x - 1] = Cell {
-                bg: previous.bg,
-                ..Cell::blank()
-            };
-            line.mark_written(x - 1);
-        }
-        if width == 1 && old.width == 2 && x + 1 < cols {
-            let next = line.cells[x + 1];
-            line.cells[x + 1] = Cell {
-                bg: next.bg,
-                ..Cell::blank()
-            };
-            line.mark_written(x + 1);
-        }
-        if width == 2 {
-            if old_next.is_some_and(|next| next.width == 2) && x + 2 < cols {
+        if width == 1 {
+            if line.cells[x].width != 1 {
+                line.clear_wide_at(x);
+            }
+        } else {
+            if line.cells[x].width == 0 && x > 0 && line.cells[x - 1].width == 2 {
+                let previous = line.cells[x - 1];
+                line.cells[x - 1] = Cell {
+                    bg: previous.bg,
+                    ..Cell::blank()
+                };
+                line.mark_written(x - 1);
+            }
+            if line.cells.get(x + 1).is_some_and(|next| next.width == 2) && x + 2 < cols {
                 let next = line.cells[x + 2];
                 line.cells[x + 2] = Cell {
                     bg: next.bg,
@@ -1573,7 +1649,6 @@ impl Terminal {
             }
             let mut continuation = cell;
             continuation.ch = ' ';
-            continuation.extra = 0;
             continuation.width = 0;
             line.cells[x + 1] = continuation;
         }
@@ -1606,7 +1681,7 @@ impl Terminal {
             return;
         }
         let cols = self.cols;
-        let (fg, bg, attrs, link) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
+        let (fg, bg, attrs, meta) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
         let (region_top, region_bottom, region_offset) =
             (self.scroll_top, self.scroll_bottom, self.region_offset);
         let map = |row: usize| -> usize {
@@ -1634,31 +1709,7 @@ impl Terminal {
                 let mut row_start = x0;
                 for &byte in bytes {
                     let line = &mut lines[physical];
-                    let old = line.cells[x];
-                    if old.width == 0 {
-                        if x > 0 && line.cells[x - 1].width == 2 {
-                            let previous = line.cells[x - 1];
-                            line.cells[x - 1] = Cell {
-                                bg: previous.bg,
-                                ..Cell::blank()
-                            };
-                        }
-                    } else if old.width == 2 && x + 1 < cols {
-                        let next = line.cells[x + 1];
-                        line.cells[x + 1] = Cell {
-                            bg: next.bg,
-                            ..Cell::blank()
-                        };
-                    }
-                    line.cells[x] = Cell {
-                        ch: byte as char,
-                        extra: 0,
-                        fg,
-                        bg,
-                        attrs,
-                        link,
-                        width: 1,
-                    };
+                    line.write_ascii(x, byte, fg, bg, attrs, meta);
                     line.wrapped = false;
                     x += 1;
                     if x == cols {
@@ -1707,32 +1758,7 @@ impl Terminal {
                 let lines = self.lines_mut();
                 let line = &mut lines[map(y)];
                 for (index, &byte) in segment.iter().enumerate() {
-                    let x = x0 + index;
-                    let old = line.cells[x];
-                    if old.width == 0 {
-                        if x > 0 && line.cells[x - 1].width == 2 {
-                            let previous = line.cells[x - 1];
-                            line.cells[x - 1] = Cell {
-                                bg: previous.bg,
-                                ..Cell::blank()
-                            };
-                        }
-                    } else if old.width == 2 && x + 1 < cols {
-                        let next = line.cells[x + 1];
-                        line.cells[x + 1] = Cell {
-                            bg: next.bg,
-                            ..Cell::blank()
-                        };
-                    }
-                    line.cells[x] = Cell {
-                        ch: byte as char,
-                        extra: 0,
-                        fg,
-                        bg,
-                        attrs,
-                        link,
-                        width: 1,
-                    };
+                    line.write_ascii(x0 + index, byte, fg, bg, attrs, meta);
                 }
                 line.mark_written_range(x0, x0 + segment.len() - 1);
                 line.wrapped = false;
@@ -1775,7 +1801,7 @@ impl Terminal {
             }
             let y = self.cursor.y;
             let start = self.cursor.x;
-            let (fg, bg, attrs, link) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
+            let (fg, bg, attrs, meta) = (self.pen.fg, self.pen.bg, self.pen.attrs, self.pen.link);
             let mut x = start;
             let mut last = None;
             let mut last_x = start;
@@ -1796,11 +1822,10 @@ impl Terminal {
                     }
                     let cell = Cell {
                         ch,
-                        extra: 0,
+                        meta,
                         fg,
                         bg,
                         attrs,
-                        link,
                         width: width as u8,
                     };
                     line.cells[x] = cell;
@@ -1862,17 +1887,17 @@ impl Terminal {
         if cell.width == 0 && x > 0 {
             return self.append_to_cluster(y, x - 1, ch);
         }
+        let (_, link_id) = self.unpack_meta(cell.meta);
         let mut cluster = String::new();
         cluster.push(cell.ch);
-        if cell.extra != 0
-            && let Some(extra) = self.extras.get(cell.extra as usize - 1)
-        {
+        if let Some(extra) = self.cell_extra(cell) {
             cluster.push_str(extra);
         }
         cluster.push(ch);
         let old_width = cell.width;
         let new_width = UnicodeWidthStr::width(cluster.as_str()).clamp(1, 2) as u8;
-        cell.extra = self.intern_extra(&cluster[cell.ch.len_utf8()..]);
+        let extra_id = self.intern_extra(&cluster[cell.ch.len_utf8()..]);
+        cell.meta = self.pack_meta(extra_id, link_id);
         cell.width = new_width;
         let cols = self.cols;
         let mut advance = false;
@@ -1886,7 +1911,11 @@ impl Terminal {
                     (1, 2) => {
                         let mut continuation = cell;
                         continuation.ch = ' ';
-                        continuation.extra = 0;
+                        continuation.meta = if link_id != 0 {
+                            META_LINK_BIT | link_id
+                        } else {
+                            0
+                        };
                         continuation.width = 0;
                         line.cells[next] = continuation;
                         line.mark_written(next);
@@ -2115,7 +2144,7 @@ impl Terminal {
     fn scroll_region_down(&mut self, top: usize, bottom: usize, count: usize) {
         let count = count.min(bottom - top + 1);
         let full = top == 0 && bottom + 1 == self.rows;
-        let shift = full && !self.in_alt() && self.scroll_offset == 0;
+        let shift = full && self.scroll_offset == 0;
         if full {
             self.normalize_region();
             for _ in 0..count {
@@ -2159,14 +2188,12 @@ impl Terminal {
         let cols = self.cols;
         let bg = self.pen.bg;
         let line = self.line_mut(y);
-        let tail: Vec<Cell> = line.cells[x..cols - count].to_vec();
-        line.cells[x + count..].copy_from_slice(&tail);
-        for cell in &mut line.cells[x..x + count] {
-            *cell = Cell {
-                bg,
-                ..Cell::blank()
-            };
-        }
+        line.cells.copy_within(x..cols - count, x + count);
+        let blank = Cell {
+            bg,
+            ..Cell::blank()
+        };
+        line.cells[x..x + count].fill(blank);
         line.mark_all_written();
         self.mark_row(y);
     }
@@ -2178,14 +2205,12 @@ impl Terminal {
         let cols = self.cols;
         let bg = self.pen.bg;
         let line = self.line_mut(y);
-        let tail: Vec<Cell> = line.cells[x + count..].to_vec();
-        line.cells[x..cols - count].copy_from_slice(&tail);
-        for cell in &mut line.cells[cols - count..] {
-            *cell = Cell {
-                bg,
-                ..Cell::blank()
-            };
-        }
+        line.cells.copy_within(x + count..cols, x);
+        let blank = Cell {
+            bg,
+            ..Cell::blank()
+        };
+        line.cells[cols - count..cols].fill(blank);
         line.mark_all_written();
         self.mark_row(y);
     }
@@ -2200,26 +2225,48 @@ impl Terminal {
         }
         let bg = self.pen.bg;
         let cols = self.cols;
+        let blank = Cell {
+            bg,
+            ..Cell::blank()
+        };
         let line = self.line_mut(y);
-        if from > 0 && line.cells[from].width == 0 {
-            line.cells[from - 1] = Cell {
-                bg,
-                ..Cell::blank()
-            };
+        if bg == Color::Default {
+            if line.written_min > line.written_max {
+                return;
+            }
+            let clamped_from = from.max(line.written_min);
+            let clamped_to = to.min(line.written_max);
+            if clamped_from > clamped_to {
+                return;
+            }
+            if clamped_from > 0 && line.cells[clamped_from].width == 0 {
+                line.cells[clamped_from - 1] = blank;
+                line.mark_written(clamped_from - 1);
+            }
+            if line.cells[clamped_to].width == 2 && clamped_to + 1 < cols {
+                line.cells[clamped_to + 1] = blank;
+                line.mark_written(clamped_to + 1);
+            }
+            line.cells[clamped_from..=clamped_to].fill(blank);
+            if from <= line.written_min && to >= line.written_max {
+                line.written_min = usize::MAX;
+                line.written_max = 0;
+            } else if from <= line.written_min {
+                line.written_min = (to + 1).min(line.written_max);
+            } else if to >= line.written_max {
+                line.written_max = from.saturating_sub(1);
+            }
+            line.revision = line.revision.wrapping_add(1);
+        } else {
+            if from > 0 && line.cells[from].width == 0 {
+                line.cells[from - 1] = blank;
+            }
+            if line.cells[to].width == 2 && to + 1 < cols {
+                line.cells[to + 1] = blank;
+            }
+            line.cells[from..=to].fill(blank);
+            line.mark_written_range(from.saturating_sub(1), (to + 1).min(cols - 1));
         }
-        if line.cells[to].width == 2 && to + 1 < cols {
-            line.cells[to + 1] = Cell {
-                bg,
-                ..Cell::blank()
-            };
-        }
-        for cell in &mut line.cells[from..=to] {
-            *cell = Cell {
-                bg,
-                ..Cell::blank()
-            };
-        }
-        line.mark_all_written();
         self.mark_row(y);
     }
 
@@ -2233,16 +2280,22 @@ impl Terminal {
             return;
         }
         self.normalize_region();
-        let count = count.min(self.scroll_bottom - self.cursor.y + 1);
+        let y = self.cursor.y;
+        let bottom = self.scroll_bottom;
+        let cols = self.cols;
+        let count = count.min(bottom - y + 1);
         for _ in 0..count {
-            let line = self.new_line();
-            let y = self.cursor.y;
-            let bottom = self.scroll_bottom;
+            let id = self.next_line_id();
             let lines = self.lines_mut();
-            lines.remove(bottom);
-            lines.insert(y, line);
+            let mut recycled = lines
+                .remove(bottom)
+                .unwrap_or_else(|| Line::new(id, vec![Cell::blank(); cols]));
+            blank_in_place(&mut recycled, id);
+            lines.insert(y, recycled);
         }
-        self.mark_all();
+        for row in y..=bottom {
+            self.mark_row(row);
+        }
     }
 
     /// Deletes lines at the cursor within the scroll region.
@@ -2251,16 +2304,22 @@ impl Terminal {
             return;
         }
         self.normalize_region();
-        let count = count.min(self.scroll_bottom - self.cursor.y + 1);
+        let y = self.cursor.y;
+        let bottom = self.scroll_bottom;
+        let cols = self.cols;
+        let count = count.min(bottom - y + 1);
         for _ in 0..count {
-            let line = self.new_line();
-            let y = self.cursor.y;
-            let bottom = self.scroll_bottom;
+            let id = self.next_line_id();
             let lines = self.lines_mut();
-            lines.remove(y);
-            lines.insert(bottom, line);
+            let mut recycled = lines
+                .remove(y)
+                .unwrap_or_else(|| Line::new(id, vec![Cell::blank(); cols]));
+            blank_in_place(&mut recycled, id);
+            lines.insert(bottom, recycled);
         }
-        self.mark_all();
+        for row in y..=bottom {
+            self.mark_row(row);
+        }
     }
 
     fn tab_forward(&mut self, count: usize) {
@@ -2381,43 +2440,30 @@ impl Terminal {
         self.scroll_offset = 0;
         self.cursor.x = 0;
         self.cursor.y = 0;
-        self.cursor.visible = true;
         self.cursor.style = self.default_cursor_style;
         self.cursor.blinking = self.default_cursor_blink;
-        self.pen = Pen::default();
-        self.active_link = 0;
         self.saved = None;
         self.alt_saved = None;
-        self.scroll_top = 0;
-        self.scroll_bottom = self.rows - 1;
-        self.charsets = [Charset::Ascii; 4];
-        self.active_charset = 0;
-        self.single_shift = None;
-        self.insert_mode = false;
         self.newline_mode = false;
-        self.origin_mode = false;
-        self.autowrap = true;
         self.reverse_video = false;
-        self.app_cursor = false;
-        self.app_keypad = false;
         self.bracketed_paste = false;
         self.focus_events = false;
-        self.mouse_mode = MouseMode::Off;
-        self.kitty_flags = [0, 0];
-        self.kitty_stack = [Vec::new(), Vec::new()];
-        self.mouse_encoding = MouseEncoding::X10;
         self.theme = self.default_theme.clone();
         self.reset_tabs();
         self.selection = None;
+        self.extras.clear();
+        self.extras_map.clear();
+        self.link_targets.clear();
+        self.link_targets_map.clear();
+        self.meta_pairs.clear();
+        self.meta_pairs_map.clear();
         if let Some(search) = &mut self.search {
             search.matches.clear();
             search.current = 0;
             search.lines.clear();
         }
         self.dirty = vec![false; self.rows];
-        self.dirty_all = true;
-        self.wrap_pending = false;
-        self.last_printed = None;
+        self.soft_reset();
     }
 
     fn soft_reset(&mut self) {
@@ -2617,7 +2663,7 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct CellSnap {
         ch: char,
-        extra: u32,
+        meta: u32,
         width: u8,
         fg: Color,
         bg: Color,
@@ -2644,7 +2690,7 @@ mod tests {
                         .iter()
                         .map(|c| CellSnap {
                             ch: c.ch,
-                            extra: c.extra,
+                            meta: c.meta,
                             width: c.width,
                             fg: c.fg,
                             bg: c.bg,
@@ -2715,20 +2761,18 @@ mod tests {
                     t.cursor.x = 2;
                     t.lines_mut()[0].cells[3] = Cell {
                         ch: '\u{4e16}',
-                        extra: 0,
+                        meta: 0,
                         fg: Color::Default,
                         bg: Color::Default,
                         attrs: Attrs::default(),
-                        link: 0,
                         width: 2,
                     };
                     t.lines_mut()[0].cells[4] = Cell {
                         ch: ' ',
-                        extra: 0,
+                        meta: 0,
                         fg: Color::Default,
                         bg: Color::Default,
                         attrs: Attrs::default(),
-                        link: 0,
                         width: 0,
                     };
                 }
@@ -2789,7 +2833,66 @@ mod tests {
         feed(&mut terminal, "e\u{301}".as_bytes());
         let cell = terminal.lines()[0].cells[0];
         assert_eq!(cell.ch, 'e');
-        assert_ne!(cell.extra, 0);
+        assert_eq!(terminal.cell_extra(cell), Some("\u{301}"));
+    }
+
+    #[test]
+    fn osc8_link_and_combining_marks_coexist() {
+        let mut terminal = terminal(2);
+        feed(
+            &mut terminal,
+            "\x1b]8;;https://example.com\x1b\\e\u{301}\x1b]8;;\x1b\\".as_bytes(),
+        );
+        let cell = terminal.lines()[0].cells[0];
+        assert_eq!(cell.ch, 'e');
+        assert_eq!(terminal.cell_extra(cell), Some("\u{301}"));
+        assert_eq!(terminal.link_at(0, 0), Some("https://example.com"));
+        assert!(terminal.cell_has_link(cell));
+    }
+
+    #[test]
+    fn cell_stays_compact() {
+        assert!(std::mem::size_of::<Cell>() <= 20);
+    }
+
+    #[test]
+    fn non_visual_private_modes_do_not_mark_screen_dirty() {
+        let mut terminal = terminal(3);
+        let _ = terminal.take_damage();
+        feed(&mut terminal, b"\x1b[?2004h\x1b[?1h\x1b[?1000h\x1b[?1006h");
+        assert!(terminal.take_damage().is_empty());
+        feed(&mut terminal, b"\x1b[?25l");
+        let damage = terminal.take_damage();
+        assert!(!damage.all);
+        assert!(damage.rows[0]);
+        assert!(!damage.rows[1]);
+    }
+
+    #[test]
+    fn insert_and_delete_cells_and_lines_preserve_content() {
+        let mut terminal = terminal(3);
+        feed(&mut terminal, b"abcdef\r\nrow1\r\nrow2");
+        feed(&mut terminal, b"\x1b[1;2H\x1b[2@");
+        assert_eq!(terminal.lines()[0].cells[0].ch, 'a');
+        assert_eq!(terminal.lines()[0].cells[1].ch, ' ');
+        assert_eq!(terminal.lines()[0].cells[2].ch, ' ');
+        assert_eq!(terminal.lines()[0].cells[3].ch, 'b');
+        feed(&mut terminal, b"\x1b[1;2H\x1b[2P");
+        assert_eq!(terminal.lines()[0].cells[1].ch, 'b');
+        feed(&mut terminal, b"\x1b[2;1H");
+        let _ = terminal.take_damage();
+        feed(&mut terminal, b"\x1b[1L");
+        let damage = terminal.take_damage();
+        assert!(!damage.all);
+        assert!(!damage.rows[0]);
+        assert!(damage.rows[1]);
+        assert!(damage.rows[2]);
+        assert_eq!(terminal.visible_line(0).unwrap().cells[0].ch, 'a');
+        assert!(terminal.visible_line(1).unwrap().cells[0].is_blank());
+        assert_eq!(terminal.visible_line(2).unwrap().cells[0].ch, 'r');
+        feed(&mut terminal, b"\x1b[2;1H\x1b[1M");
+        assert_eq!(terminal.visible_line(1).unwrap().cells[0].ch, 'r');
+        assert!(terminal.visible_line(2).unwrap().cells[0].is_blank());
     }
 
     #[test]
@@ -3236,7 +3339,7 @@ mod textrun_equiv {
             for c in &l.cells {
                 o.push_str(&format!(
                     "{}:{}:{}:{:?}:{:?}",
-                    c.ch, c.width, c.extra, c.fg, c.bg
+                    c.ch, c.width, c.meta, c.fg, c.bg
                 ));
             }
             o.push(']');

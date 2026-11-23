@@ -83,76 +83,20 @@ impl Utf8 {
     }
 }
 
-/// Parses `ESC [ row ; col H` without going through the byte state machine.
-fn parse_cursor_position(bytes: &[u8]) -> Option<(u32, u32, usize)> {
-    if bytes.len() < 5 || bytes[0] != 0x1b || bytes[1] != b'[' {
-        return None;
-    }
-    let mut i = 2;
-    let mut row = 0u32;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        row = row
-            .saturating_mul(10)
-            .saturating_add((bytes[i] - b'0') as u32);
-        i += 1;
-    }
-    if i >= bytes.len() || bytes[i] != b';' {
-        return None;
-    }
-    i += 1;
-    let mut col = 0u32;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        col = col
-            .saturating_mul(10)
-            .saturating_add((bytes[i] - b'0') as u32);
-        i += 1;
-    }
-    if i >= bytes.len() || bytes[i] != b'H' || row == 0 || col == 0 {
-        return None;
-    }
-    Some((row, col, i + 1))
-}
-
-/// Matches `CSI 38 ; 5 ; N m` and `CSI 48 ; 5 ; N m`, the common indexed-color
-/// form. Returns (is_foreground, color, length).
-fn parse_indexed_color(bytes: &[u8]) -> Option<(bool, u8, usize)> {
-    if bytes.len() < 9 || bytes[0] != 0x1b || bytes[1] != b'[' {
-        return None;
-    }
-    let foreground = match (bytes[2], bytes[3]) {
-        (b'3', b'8') => true,
-        (b'4', b'8') => false,
-        _ => return None,
-    };
-    if bytes[4] != b';' || bytes[5] != b'5' || bytes[6] != b';' {
-        return None;
-    }
-    let mut value = 0u16;
-    let mut i = 7;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        value = value * 10 + (bytes[i] - b'0') as u16;
-        if value > 255 {
-            return None;
-        }
-        i += 1;
-    }
-    if i == 7 || bytes.get(i) != Some(&b'm') {
-        return None;
-    }
-    Some((foreground, value as u8, i + 1))
-}
-
-/// Parses a plain `ESC [ <digits> (;<digits>)* m` SGR into fixed arrays,
-/// matching the byte state machine's params/separators semantics. Returns the
-/// params, separators, count and bytes consumed. Anything with a private
-/// marker, intermediate, subparameter other than `;`, or non-SGR final falls
-/// back to the state machine.
-fn parse_sgr(bytes: &[u8]) -> Option<([u32; 32], [u8; 32], usize, usize)> {
+/// Parses a plain `ESC [ <digits> (;<digits>)* <final>` CSI sequence without
+/// going through the byte state machine, writing parsed parameters directly
+/// into `params`/`seps`. Returns `(param_count, final_byte, bytes_consumed)`.
+/// Anything with a private marker, intermediate, `:` subparameter, or more
+/// than `params.len()` parameters returns `None` and falls back to the state
+/// machine.
+fn parse_plain_csi(
+    bytes: &[u8],
+    params: &mut [u32],
+    seps: &mut [u8],
+) -> Option<(usize, u8, usize)> {
     if bytes.len() < 3 || bytes[0] != 0x1b || bytes[1] != b'[' {
         return None;
     }
-    let mut params = [0u32; 32];
-    let mut seps = [0u8; 32];
     let mut count = 0usize;
     let mut current = 0u32;
     let mut current_set = false;
@@ -180,7 +124,7 @@ fn parse_sgr(bytes: &[u8]) -> Option<([u32; 32], [u8; 32], usize, usize)> {
                 current_sep = b';';
                 i += 1;
             }
-            b'm' => {
+            final_byte @ 0x40..=0x7e => {
                 if current_set || current_sep != 0 || count != 0 {
                     if count >= params.len() {
                         return None;
@@ -189,12 +133,41 @@ fn parse_sgr(bytes: &[u8]) -> Option<([u32; 32], [u8; 32], usize, usize)> {
                     seps[count] = current_sep;
                     count += 1;
                 }
-                return Some((params, seps, count, i + 1));
+                return Some((count, final_byte, i + 1));
             }
             _ => return None,
         }
     }
     None
+}
+
+/// Fast-path for `CSI 38 ; 5 ; N m` and `CSI 48 ; 5 ; N m` (indexed color)
+/// when already confirmed to start with `ESC [`.
+fn parse_indexed_color(bytes: &[u8]) -> Option<(bool, u8, usize)> {
+    if bytes.len() < 9 {
+        return None;
+    }
+    let foreground = match (bytes[2], bytes[3]) {
+        (b'3', b'8') => true,
+        (b'4', b'8') => false,
+        _ => return None,
+    };
+    if bytes[4] != b';' || bytes[5] != b'5' || bytes[6] != b';' {
+        return None;
+    }
+    let mut value = 0u16;
+    let mut i = 7;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        value = value * 10 + (bytes[i] - b'0') as u16;
+        if value > 255 {
+            return None;
+        }
+        i += 1;
+    }
+    if i == 7 || bytes.get(i) != Some(&b'm') {
+        return None;
+    }
+    Some((foreground, value as u8, i + 1))
 }
 
 pub struct Parser {
@@ -235,44 +208,20 @@ impl Parser {
     }
 
     pub fn advance(&mut self, bytes: &[u8], terminal: &mut Terminal) {
+        let mut csi_params = [0u32; 32];
+        let mut csi_seps = [0u8; 32];
         let mut index = 0;
         while index < bytes.len() {
-            if matches!(self.state, State::Ground)
-                && self.utf8.needed == 0
-                && let Some((row, col, len)) = parse_cursor_position(&bytes[index..])
-            {
-                terminal.csi_dispatch(0, &[], &[row, col], &[], b'H');
-                index += len;
-                continue;
-            }
-            if matches!(self.state, State::Ground)
-                && self.utf8.needed == 0
-                && let Some((foreground, color, len)) = parse_indexed_color(&bytes[index..])
-            {
-                if foreground {
-                    terminal.set_indexed_fg(color);
-                } else {
-                    terminal.set_indexed_bg(color);
-                }
-                index += len;
-                continue;
-            }
-            if matches!(self.state, State::Ground)
-                && self.utf8.needed == 0
-                && let Some((params, seps, n, len)) = parse_sgr(&bytes[index..])
-            {
-                terminal.csi_dispatch(0, &[], &params[..n], &seps[..n], b'm');
-                index += len;
-                continue;
-            }
             if matches!(self.state, State::Ground) && self.utf8.needed == 0 {
-                let start = index;
-                let mut ascii_only = true;
-                while index < bytes.len() && bytes[index] >= 0x20 && bytes[index] != 0x7f {
-                    ascii_only &= bytes[index] < 0x80;
+                let b = bytes[index];
+                if b >= 0x20 && b != 0x7f {
+                    let start = index;
+                    let mut ascii_only = b < 0x80;
                     index += 1;
-                }
-                if index > start {
+                    while index < bytes.len() && bytes[index] >= 0x20 && bytes[index] != 0x7f {
+                        ascii_only &= bytes[index] < 0x80;
+                        index += 1;
+                    }
                     if ascii_only {
                         terminal.print_ascii_run(&bytes[start..index]);
                         continue;
@@ -289,20 +238,22 @@ impl Parser {
                         index = start + text.len();
                         continue;
                     }
-                }
-                index = start;
-                let b = bytes[index];
-                if (0xc2..=0xf4).contains(&b) {
-                    let len = match b {
-                        0xc2..=0xdf => 2,
-                        0xe0..=0xef => 3,
-                        _ => 4,
-                    };
-                    if index + len <= bytes.len()
-                        && let Ok(text) = std::str::from_utf8(&bytes[index..index + len])
-                        && let Some(ch) = text.chars().next()
+                    index = start;
+                } else if b == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+                    let slice = &bytes[index..];
+                    if let Some((foreground, color, len)) = parse_indexed_color(slice) {
+                        if foreground {
+                            terminal.set_indexed_fg(color);
+                        } else {
+                            terminal.set_indexed_bg(color);
+                        }
+                        index += len;
+                        continue;
+                    }
+                    if let Some((n, final_byte, len)) =
+                        parse_plain_csi(slice, &mut csi_params, &mut csi_seps)
                     {
-                        terminal.print(ch);
+                        terminal.csi_dispatch(0, &[], &csi_params[..n], &csi_seps[..n], final_byte);
                         index += len;
                         continue;
                     }
@@ -740,8 +691,11 @@ mod tests {
             b"\x1b[10;20;30;40;50;60m",
         ];
         for &bytes in cases {
-            let (params, seps, n, len) =
-                parse_sgr(bytes).unwrap_or_else(|| panic!("no parse: {:?}", bytes));
+            let mut params = [0u32; 32];
+            let mut seps = [0u8; 32];
+            let (n, final_byte, len) = parse_plain_csi(bytes, &mut params, &mut seps)
+                .unwrap_or_else(|| panic!("no parse: {:?}", bytes));
+            assert_eq!(final_byte, b'm');
             assert_eq!(len, bytes.len());
             // Reference: replicate the byte state machine's param building.
             let (mut rp, mut rs, mut cur, mut set, mut csep) =

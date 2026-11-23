@@ -111,7 +111,7 @@ impl Theme {
 }
 
 /// Darkens a colour to two thirds, the usual terminal meaning of dim.
-fn dim(color: Rgb) -> Rgb {
+pub fn dim(color: Rgb) -> Rgb {
     [
         (color[0] as u16 * 2 / 3) as u8,
         (color[1] as u16 * 2 / 3) as u8,

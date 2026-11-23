@@ -59,6 +59,36 @@ pub struct Dimensions {
     pub lines: u16,
 }
 
+impl Dimensions {
+    pub fn resolved(self) -> (u16, u16) {
+        (
+            if self.columns == 0 { 80 } else { self.columns },
+            if self.lines == 0 { 24 } else { self.lines },
+        )
+    }
+
+    pub fn window_pixels(
+        self,
+        padding: Padding,
+        cell_width: u16,
+        cell_height: u16,
+        gutter: u16,
+    ) -> (u16, u16) {
+        let (columns, lines) = self.resolved();
+        (
+            columns
+                .saturating_mul(cell_width)
+                .saturating_add(padding.x.saturating_mul(2))
+                .saturating_add(gutter)
+                .max(1),
+            lines
+                .saturating_mul(cell_height)
+                .saturating_add(padding.y.saturating_mul(2))
+                .max(1),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Padding {
     pub x: u16,
@@ -750,29 +780,36 @@ pub fn parse_color(value: &str) -> Result<[u8; 3], String> {
     named.ok_or_else(|| format!("invalid colour {value:?}"))
 }
 
+pub fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn parse_hex_color(rest: &str) -> Result<[u8; 3], String> {
-    let digits: Vec<u8> = rest
-        .bytes()
-        .map(|byte| match byte {
-            b'0'..=b'9' => Ok(byte - b'0'),
-            b'a'..=b'f' => Ok(byte - b'a' + 10),
-            b'A'..=b'F' => Ok(byte - b'A' + 10),
-            _ => Err(()),
-        })
-        .collect::<Result<_, _>>()
-        .map_err(|_| format!("invalid colour #{rest}"))?;
-    match digits.len() {
-        3 => Ok([digits[0] * 17, digits[1] * 17, digits[2] * 17]),
+    let bytes = rest.as_bytes();
+    let nibble =
+        |index: usize| hex_nibble(bytes[index]).ok_or_else(|| format!("invalid colour #{rest}"));
+    match bytes.len() {
+        3 => Ok([nibble(0)? * 17, nibble(1)? * 17, nibble(2)? * 17]),
         6 => Ok([
-            digits[0] * 16 + digits[1],
-            digits[2] * 16 + digits[3],
-            digits[4] * 16 + digits[5],
+            (nibble(0)? << 4) | nibble(1)?,
+            (nibble(2)? << 4) | nibble(3)?,
+            (nibble(4)? << 4) | nibble(5)?,
         ]),
-        12 => Ok([
-            digits[0] * 16 + digits[1],
-            digits[4] * 16 + digits[5],
-            digits[8] * 16 + digits[9],
-        ]),
+        12 => {
+            for i in 0..12 {
+                nibble(i)?;
+            }
+            Ok([
+                (nibble(0)? << 4) | nibble(1)?,
+                (nibble(4)? << 4) | nibble(5)?,
+                (nibble(8)? << 4) | nibble(9)?,
+            ])
+        }
         _ => Err(format!("invalid colour #{rest}")),
     }
 }

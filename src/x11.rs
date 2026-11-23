@@ -1,9 +1,9 @@
 //! Direct X11 protocol, using x11rb. No libX11 or XCB.
 
-use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Instant;
 
+use x11rb::atom_manager;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::properties::WmSizeHints;
 use x11rb::protocol::Event;
@@ -22,6 +22,7 @@ use xkeysym::{KeyCode, Keysym};
 use crate::config::{Dimensions, Padding, WindowConfig};
 use crate::input::Mods;
 use crate::render::Canvas;
+use crate::scale;
 use crate::scrollbar;
 use crate::theme::Rgb;
 
@@ -59,27 +60,29 @@ pub enum UiEvent {
     Error(String),
 }
 
-struct Atoms {
-    wm_protocols: Atom,
-    wm_delete_window: Atom,
-    net_wm_sync_request: Atom,
-    net_wm_sync_request_counter: Atom,
-    net_wm_name: Atom,
-    net_wm_pid: Atom,
-    net_wm_window_opacity: Atom,
-    net_wm_state: Atom,
-    net_wm_state_fullscreen: Atom,
-    net_wm_state_maximized_vert: Atom,
-    net_wm_state_maximized_horz: Atom,
-    motif_wm_hints: Atom,
-    utf8_string: Atom,
-    clipboard: Atom,
-    primary: Atom,
-    targets: Atom,
-    text: Atom,
-    plain_utf8: Atom,
-    incr: Atom,
-    reliabilitty_selection: Atom,
+atom_manager! {
+    Atoms: AtomsCookie {
+        WM_PROTOCOLS,
+        WM_DELETE_WINDOW,
+        _NET_WM_SYNC_REQUEST,
+        _NET_WM_SYNC_REQUEST_COUNTER,
+        _NET_WM_NAME,
+        _NET_WM_PID,
+        _NET_WM_WINDOW_OPACITY,
+        _NET_WM_STATE,
+        _NET_WM_STATE_FULLSCREEN,
+        _NET_WM_STATE_MAXIMIZED_VERT,
+        _NET_WM_STATE_MAXIMIZED_HORZ,
+        _MOTIF_WM_HINTS,
+        UTF8_STRING,
+        CLIPBOARD,
+        PRIMARY,
+        TARGETS,
+        TEXT,
+        PLAIN_UTF8: b"text/plain;charset=utf-8",
+        INCR,
+        RELIABILITTY_SELECTION,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -156,7 +159,7 @@ impl ShmSegment {
         unsafe { std::slice::from_raw_parts_mut(self.address, self.length) }
     }
 
-    fn destroy(&mut self, connection: &RustConnection) {
+    fn unmap(&mut self) {
         if !self.address.is_null() {
             // SAFETY: the address and length came from mmap.
             unsafe {
@@ -164,18 +167,17 @@ impl ShmSegment {
             }
             self.address = std::ptr::null_mut();
         }
+    }
+
+    fn destroy(&mut self, connection: &RustConnection) {
+        self.unmap();
         let _ = connection.shm_detach(self.id);
     }
 }
 
 impl Drop for ShmSegment {
     fn drop(&mut self) {
-        if !self.address.is_null() {
-            // SAFETY: the address and length came from mmap.
-            unsafe {
-                libc::munmap(self.address as *mut libc::c_void, self.length);
-            }
-        }
+        self.unmap();
     }
 }
 
@@ -309,9 +311,15 @@ pub struct X11 {
     fullscreen: bool,
 }
 
+pub fn connect() -> Result<(RustConnection, usize), String> {
+    x11rb::connect(None).map_err(|error| format!("cannot open X11 display: {error}"))
+}
+
 impl X11 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        connection: RustConnection,
+        screen_number: usize,
         window_config: &WindowConfig,
         title: &str,
         instance: &str,
@@ -321,8 +329,6 @@ impl X11 {
         cell_height: u16,
         background: Rgb,
     ) -> Result<Self, String> {
-        let (connection, screen_number) =
-            x11rb::connect(None).map_err(|error| format!("cannot open X11 display: {error}"))?;
         let screen = connection.setup().roots[screen_number].clone();
         let root = screen.root;
         let root_visual = screen
@@ -359,7 +365,10 @@ impl X11 {
             PixelFormat::from_masks(visual.red_mask, visual.green_mask, visual.blue_mask)
                 .ok_or_else(|| "the X11 visual has no RGB masks".to_string())?;
         let background_alpha = (window_config.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let atoms = Atoms::intern(&connection)?;
+        let atoms = Atoms::new(&connection)
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|error| error.to_string())?;
         let window = connection
             .generate_id()
             .map_err(|error| error.to_string())?;
@@ -378,25 +387,9 @@ impl X11 {
             None
         };
 
-        let columns = if dimensions.columns == 0 {
-            80
-        } else {
-            dimensions.columns
-        };
-        let lines = if dimensions.lines == 0 {
-            24
-        } else {
-            dimensions.lines
-        };
         let padding = window_config.padding;
-        let width = columns
-            .saturating_mul(cell_width)
-            .saturating_add(padding.x.saturating_mul(2))
-            .max(1);
-        let height = lines
-            .saturating_mul(cell_height)
-            .saturating_add(padding.y.saturating_mul(2))
-            .max(1);
+        let gutter = scrollbar::width(cell_width);
+        let (width, height) = dimensions.window_pixels(padding, cell_width, cell_height, gutter);
         let mut background_pixel = pixel_format.pixel(crate::render::rgb(background));
         if argb {
             background_pixel |= (background_alpha as u32) << 24;
@@ -458,7 +451,7 @@ impl X11 {
                 .change_property32(
                     PropMode::REPLACE,
                     window,
-                    atoms.net_wm_sync_request_counter,
+                    atoms._NET_WM_SYNC_REQUEST_COUNTER,
                     AtomEnum::CARDINAL,
                     &[basic, extended],
                 )
@@ -468,24 +461,7 @@ impl X11 {
             None
         };
 
-        connection
-            .change_property8(
-                PropMode::REPLACE,
-                window,
-                xproto::AtomEnum::WM_NAME,
-                xproto::AtomEnum::STRING,
-                title.as_bytes(),
-            )
-            .map_err(|error| error.to_string())?;
-        connection
-            .change_property8(
-                PropMode::REPLACE,
-                window,
-                atoms.net_wm_name,
-                atoms.utf8_string,
-                title.as_bytes(),
-            )
-            .map_err(|error| error.to_string())?;
+        set_title_properties(&connection, window, &atoms, title)?;
         let mut class_name = Vec::new();
         class_name.extend_from_slice(instance.as_bytes());
         class_name.push(0);
@@ -505,43 +481,34 @@ impl X11 {
             .change_property32(
                 PropMode::REPLACE,
                 window,
-                atoms.net_wm_pid,
+                atoms._NET_WM_PID,
                 xproto::AtomEnum::CARDINAL,
                 &[pid],
             )
             .map_err(|error| error.to_string())?;
-        let mut protocols = vec![atoms.wm_delete_window];
+        let mut protocols = vec![atoms.WM_DELETE_WINDOW];
         if sync_counters.is_some() {
-            protocols.push(atoms.net_wm_sync_request);
+            protocols.push(atoms._NET_WM_SYNC_REQUEST);
         }
         connection
             .change_property32(
                 PropMode::REPLACE,
                 window,
-                atoms.wm_protocols,
+                atoms.WM_PROTOCOLS,
                 xproto::AtomEnum::ATOM,
                 &protocols,
             )
             .map_err(|error| error.to_string())?;
         if !argb && window_config.opacity < 1.0 {
-            let opacity = (window_config.opacity.clamp(0.0, 1.0) * u32::MAX as f32) as u32;
-            connection
-                .change_property32(
-                    PropMode::REPLACE,
-                    window,
-                    atoms.net_wm_window_opacity,
-                    xproto::AtomEnum::CARDINAL,
-                    &[opacity],
-                )
-                .map_err(|error| error.to_string())?;
+            set_opacity_property(&connection, window, &atoms, window_config.opacity)?;
         }
         if window_config.decorations.eq_ignore_ascii_case("none") {
             connection
                 .change_property32(
                     PropMode::REPLACE,
                     window,
-                    atoms.motif_wm_hints,
-                    atoms.motif_wm_hints,
+                    atoms._MOTIF_WM_HINTS,
+                    atoms._MOTIF_WM_HINTS,
                     &[2, 0, 0, 0, 0],
                 )
                 .map_err(|error| error.to_string())?;
@@ -552,11 +519,11 @@ impl X11 {
                     .change_property32(
                         PropMode::REPLACE,
                         window,
-                        atoms.net_wm_state,
+                        atoms._NET_WM_STATE,
                         xproto::AtomEnum::ATOM,
                         &[
-                            atoms.net_wm_state_maximized_vert,
-                            atoms.net_wm_state_maximized_horz,
+                            atoms._NET_WM_STATE_MAXIMIZED_VERT,
+                            atoms._NET_WM_STATE_MAXIMIZED_HORZ,
                         ],
                     )
                     .map_err(|error| error.to_string())?;
@@ -566,21 +533,16 @@ impl X11 {
                     .change_property32(
                         PropMode::REPLACE,
                         window,
-                        atoms.net_wm_state,
+                        atoms._NET_WM_STATE,
                         xproto::AtomEnum::ATOM,
-                        &[atoms.net_wm_state_fullscreen],
+                        &[atoms._NET_WM_STATE_FULLSCREEN],
                     )
                     .map_err(|error| error.to_string())?;
             }
             _ => {}
         }
 
-        let hints = size_hints(
-            padding,
-            cell_width,
-            cell_height,
-            scrollbar::width(cell_width),
-        );
+        let hints = size_hints(padding, cell_width, cell_height, gutter);
         hints
             .set_normal_hints(&connection, window)
             .map_err(|error| error.to_string())?;
@@ -647,6 +609,11 @@ impl X11 {
         })
     }
 
+    pub fn detect_dpi(connection: &RustConnection, screen_number: usize) -> f32 {
+        let root = connection.setup().roots[screen_number].root;
+        scale::detect(connection, root)
+    }
+
     pub fn fd(&self) -> std::os::fd::RawFd {
         self.connection.stream().as_raw_fd()
     }
@@ -670,19 +637,10 @@ impl X11 {
             return Ok(());
         }
         if opacity < 1.0 {
-            let value = (opacity.clamp(0.0, 1.0) * u32::MAX as f32) as u32;
-            self.connection
-                .change_property32(
-                    PropMode::REPLACE,
-                    self.window,
-                    self.atoms.net_wm_window_opacity,
-                    xproto::AtomEnum::CARDINAL,
-                    &[value],
-                )
-                .map_err(|error| error.to_string())?;
+            set_opacity_property(&self.connection, self.window, &self.atoms, opacity)?;
         } else {
             self.connection
-                .delete_property(self.window, self.atoms.net_wm_window_opacity)
+                .delete_property(self.window, self.atoms._NET_WM_WINDOW_OPACITY)
                 .map_err(|error| error.to_string())?;
         }
         self.connection.flush().map_err(|error| error.to_string())
@@ -709,22 +667,25 @@ impl X11 {
             Some(reply) => reply,
             None => return FALLBACK,
         };
-        let mut active: Vec<_> = resources
+        let crtc_cookies: Vec<_> = resources
             .crtcs
             .iter()
             .filter_map(|crtc| {
                 self.connection
                     .randr_get_crtc_info(*crtc, resources.config_timestamp)
                     .ok()
-                    .and_then(|cookie| cookie.reply().ok())
             })
-            .filter(|info| info.width > 0 && info.height > 0)
             .collect();
-        let origin = self
+        let origin_cookie = self
             .connection
             .translate_coordinates(self.window, self.root, 0, 0)
-            .ok()
-            .and_then(|cookie| cookie.reply().ok());
+            .ok();
+        let mut active: Vec<_> = crtc_cookies
+            .into_iter()
+            .filter_map(|cookie| cookie.reply().ok())
+            .filter(|info| info.width > 0 && info.height > 0)
+            .collect();
+        let origin = origin_cookie.and_then(|cookie| cookie.reply().ok());
         if let Some(origin) = origin {
             let x = origin.dst_x as i32 + self.width as i32 / 2;
             let y = origin.dst_y as i32 + self.height as i32 / 2;
@@ -758,24 +719,7 @@ impl X11 {
     }
 
     pub fn set_title(&self, title: &str) -> Result<(), String> {
-        self.connection
-            .change_property8(
-                PropMode::REPLACE,
-                self.window,
-                xproto::AtomEnum::WM_NAME,
-                xproto::AtomEnum::STRING,
-                title.as_bytes(),
-            )
-            .map_err(|error| error.to_string())?;
-        self.connection
-            .change_property8(
-                PropMode::REPLACE,
-                self.window,
-                self.atoms.net_wm_name,
-                self.atoms.utf8_string,
-                title.as_bytes(),
-            )
-            .map_err(|error| error.to_string())?;
+        set_title_properties(&self.connection, self.window, &self.atoms, title)?;
         self.connection.flush().map_err(|error| error.to_string())
     }
 
@@ -820,8 +764,8 @@ impl X11 {
             format: 32,
             sequence: 0,
             window: self.window,
-            type_: self.atoms.net_wm_state,
-            data: [action, self.atoms.net_wm_state_fullscreen, 0, 1, 0].into(),
+            type_: self.atoms._NET_WM_STATE,
+            data: [action, self.atoms._NET_WM_STATE_FULLSCREEN, 0, 1, 0].into(),
         };
         self.connection
             .send_event(
@@ -898,24 +842,30 @@ impl X11 {
         if w == 0 || h == 0 {
             return;
         }
-        if self.write_rect(canvas, x0, y0, w, h) && self.shm_copy(canvas, x0, y0, w, h) {
+        if self.write_rect(canvas, x0, y0, w, h).is_some() && self.shm_copy(canvas, x0, y0, w, h) {
             return;
         }
         self.present_slow(canvas, y0 as u16, h as u16);
     }
 
     /// Copies the requested rectangle from the canvas into the shared segment,
-    /// translating from the canvas stride to the segment stride.
-    fn write_rect(&mut self, canvas: &Canvas, x0: usize, y0: usize, w: usize, h: usize) -> bool {
+    /// translating from the canvas stride to the segment stride. Returns
+    /// `Some(true)` when a freshly allocated segment caused a full-canvas copy.
+    fn write_rect(
+        &mut self,
+        canvas: &Canvas,
+        x0: usize,
+        y0: usize,
+        w: usize,
+        h: usize,
+    ) -> Option<bool> {
         self.ensure_shm(canvas.stride, canvas.height);
         if self.shm_failed {
-            return false;
+            return None;
         }
         let fresh = self.shm_fresh;
         self.shm_fresh = false;
-        let Some(segment) = &mut self.shm else {
-            return false;
-        };
+        let segment = self.shm.as_mut()?;
         // A freshly allocated segment has undefined contents, so populate the
         // whole texture once instead of just the requested rectangle.
         let (x0, y0, w, h) = if fresh {
@@ -932,13 +882,27 @@ impl X11 {
         let row_bytes = stride * 4;
         let buffer_stride = canvas.stride as usize;
         if stride < canvas.width as usize || (y0 + h) * row_bytes > segment.length {
-            return false;
+            return None;
+        }
+        if x0 == 0 && w == buffer_stride && buffer_stride == stride {
+            let source = y0 * buffer_stride;
+            let count = h * buffer_stride;
+            if source + count > canvas.pixels.len() {
+                return None;
+            }
+            let destination = y0 * row_bytes;
+            Self::write_pixels(
+                self.pixel_format,
+                &canvas.pixels[source..source + count],
+                &mut segment.bytes()[destination..destination + count * 4],
+            );
+            return Some(fresh);
         }
         for row in 0..h {
             let source = (y0 + row) * buffer_stride + x0;
             let destination = (y0 + row) * row_bytes + x0 * 4;
             if source + w > canvas.pixels.len() {
-                return false;
+                return None;
             }
             Self::write_pixels(
                 self.pixel_format,
@@ -946,7 +910,7 @@ impl X11 {
                 &mut segment.bytes()[destination..destination + w * 4],
             );
         }
-        true
+        Some(fresh)
     }
 
     fn shm_copy(&self, canvas: &Canvas, x0: usize, y0: usize, w: usize, h: usize) -> bool {
@@ -988,7 +952,14 @@ impl X11 {
         for &(x, y, width, height) in rects {
             let (x0, y0, w, h) = Self::clip_rect(canvas, x, y, width, height);
             if w > 0 && h > 0 {
-                ok &= self.write_rect(canvas, x0, y0, w, h);
+                match self.write_rect(canvas, x0, y0, w, h) {
+                    Some(true) => break,
+                    Some(false) => {}
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
             }
         }
         // A resize discards the window's X pixmap even on a composited
@@ -1074,6 +1045,12 @@ impl X11 {
             }
             None => self.shm_failed = true,
         }
+    }
+
+    /// Releases an oversized shared segment after the canvas stride compacts,
+    /// so subsequent frames match stride and use a single contiguous copy.
+    pub fn reset_shm(&mut self) {
+        self.destroy_shm();
     }
 
     fn destroy_shm(&mut self) {
@@ -1183,23 +1160,12 @@ impl X11 {
                 });
             }
             Event::KeyRelease(_) => {}
-            Event::ButtonPress(event) => {
+            Event::ButtonPress(event) | Event::ButtonRelease(event) => {
+                let pressed = event.response_type & 0x7f == xproto::BUTTON_PRESS_EVENT;
                 self.last_time = event.time;
                 output.push(UiEvent::Button {
                     button: event.detail,
-                    pressed: true,
-                    x: event.event_x,
-                    y: event.event_y,
-                    time: event.time,
-                    mods: mods_from_mask(event.state),
-                    state: u16::from(event.state),
-                });
-            }
-            Event::ButtonRelease(event) => {
-                self.last_time = event.time;
-                output.push(UiEvent::Button {
-                    button: event.detail,
-                    pressed: false,
+                    pressed,
                     x: event.event_x,
                     y: event.event_y,
                     time: event.time,
@@ -1238,13 +1204,13 @@ impl X11 {
             }
             Event::ClientMessage(event) => {
                 if event.window == self.window
-                    && event.type_ == self.atoms.wm_protocols
+                    && event.type_ == self.atoms.WM_PROTOCOLS
                     && event.format == 32
                 {
                     let data = event.data.as_data32();
-                    if data[0] == self.atoms.wm_delete_window {
+                    if data[0] == self.atoms.WM_DELETE_WINDOW {
                         output.push(UiEvent::Close);
-                    } else if data[0] == self.atoms.net_wm_sync_request
+                    } else if data[0] == self.atoms._NET_WM_SYNC_REQUEST
                         && self.sync_counters.is_some()
                     {
                         let now = Instant::now();
@@ -1272,9 +1238,9 @@ impl X11 {
                 self.answer_selection(event);
             }
             Event::SelectionClear(event) => {
-                if event.selection == self.atoms.clipboard {
+                if event.selection == self.atoms.CLIPBOARD {
                     self.clipboard.clipboard_text = None;
-                } else if event.selection == self.atoms.primary {
+                } else if event.selection == self.atoms.PRIMARY {
                     self.clipboard.primary_text = None;
                 }
             }
@@ -1292,18 +1258,14 @@ impl X11 {
         }
     }
 
-    /// Resolves a keycode to a keysym, consulting XKB for the active group.
+    /// Resolves a keycode to a keysym using the active XKB group from `state`.
     fn key_keysym(&self, keycode: u8, state: KeyButMask) -> u32 {
         let flags = u16::from(state);
         let shift = flags & u16::from(KeyButMask::SHIFT) != 0;
         let alt_gr = flags & u16::from(KeyButMask::MOD5) != 0;
+        // XKB encodes the 2-bit active group index in bits 13..=14 of core event state.
         let group = if self.xkb && self.keymap.keysyms_per_keycode > 2 {
-            self.connection
-                .xkb_get_state(xkb::ID::USE_CORE_KBD.into())
-                .ok()
-                .and_then(|cookie| cookie.reply().ok())
-                .map(|reply| u8::from(reply.group))
-                .unwrap_or(0)
+            ((flags >> 13) & 0x3) as u8
         } else {
             0
         };
@@ -1345,13 +1307,13 @@ impl X11 {
         if primary {
             self.clipboard.primary_text = Some(text.to_string());
             self.connection
-                .set_selection_owner(self.window, self.atoms.primary, time)
+                .set_selection_owner(self.window, self.atoms.PRIMARY, time)
                 .map_err(|error| error.to_string())?;
         }
         if clipboard {
             self.clipboard.clipboard_text = Some(text.to_string());
             self.connection
-                .set_selection_owner(self.window, self.atoms.clipboard, time)
+                .set_selection_owner(self.window, self.atoms.CLIPBOARD, time)
                 .map_err(|error| error.to_string())?;
         }
         self.connection.flush().map_err(|error| error.to_string())
@@ -1367,9 +1329,9 @@ impl X11 {
 
     pub fn request_paste(&mut self, primary: bool, time: u32) -> Result<(), String> {
         let selection = if primary {
-            self.atoms.primary
+            self.atoms.PRIMARY
         } else {
-            self.atoms.clipboard
+            self.atoms.CLIPBOARD
         };
         self.clipboard.pending = Some(PendingPaste {
             selection: if primary { b'p' } else { b'c' },
@@ -1379,8 +1341,8 @@ impl X11 {
             .convert_selection(
                 self.window,
                 selection,
-                self.atoms.utf8_string,
-                self.atoms.reliabilitty_selection,
+                self.atoms.UTF8_STRING,
+                self.atoms.RELIABILITTY_SELECTION,
                 time,
             )
             .map_err(|error| error.to_string())?;
@@ -1394,9 +1356,9 @@ impl X11 {
         if event.property == AtomEnum::NONE.into() {
             if !pending.fallback {
                 let selection = if pending.selection == b'p' {
-                    self.atoms.primary
+                    self.atoms.PRIMARY
                 } else {
-                    self.atoms.clipboard
+                    self.atoms.CLIPBOARD
                 };
                 self.clipboard.pending = Some(PendingPaste {
                     selection: pending.selection,
@@ -1406,7 +1368,7 @@ impl X11 {
                     self.window,
                     selection,
                     u32::from(xproto::AtomEnum::STRING),
-                    self.atoms.reliabilitty_selection,
+                    self.atoms.RELIABILITTY_SELECTION,
                     event.time,
                 );
                 let _ = self.connection.flush();
@@ -1427,7 +1389,7 @@ impl X11 {
         let Ok(reply) = cookie.reply() else {
             return;
         };
-        if reply.type_ == self.atoms.incr {
+        if reply.type_ == self.atoms.INCR {
             // No INCR support; skip large transfers.
             let _ = self.connection.delete_property(self.window, event.property);
             return;
@@ -1439,9 +1401,9 @@ impl X11 {
     }
 
     fn answer_selection(&mut self, event: xproto::SelectionRequestEvent) {
-        let text = if event.selection == self.atoms.clipboard {
+        let text = if event.selection == self.atoms.CLIPBOARD {
             self.clipboard.clipboard_text.clone()
-        } else if event.selection == self.atoms.primary {
+        } else if event.selection == self.atoms.PRIMARY {
             self.clipboard.primary_text.clone()
         } else {
             None
@@ -1455,7 +1417,7 @@ impl X11 {
         } else {
             event.property
         };
-        let success = if event.target == self.atoms.targets {
+        let success = if event.target == self.atoms.TARGETS {
             self.connection
                 .change_property32(
                     PropMode::REPLACE,
@@ -1463,17 +1425,17 @@ impl X11 {
                     property,
                     xproto::AtomEnum::ATOM,
                     &[
-                        self.atoms.targets,
-                        self.atoms.utf8_string,
+                        self.atoms.TARGETS,
+                        self.atoms.UTF8_STRING,
                         xproto::AtomEnum::STRING.into(),
-                        self.atoms.text,
-                        self.atoms.plain_utf8,
+                        self.atoms.TEXT,
+                        self.atoms.PLAIN_UTF8,
                     ],
                 )
                 .is_ok()
-        } else if event.target == self.atoms.utf8_string
-            || event.target == self.atoms.text
-            || event.target == self.atoms.plain_utf8
+        } else if event.target == self.atoms.UTF8_STRING
+            || event.target == self.atoms.TEXT
+            || event.target == self.atoms.PLAIN_UTF8
             || event.target == u32::from(xproto::AtomEnum::STRING)
         {
             self.connection
@@ -1532,62 +1494,50 @@ impl Drop for X11 {
     }
 }
 
-impl Atoms {
-    fn intern(connection: &RustConnection) -> Result<Self, String> {
-        let mut names: BTreeMap<&'static str, Atom> = BTreeMap::new();
-        for name in [
-            "WM_PROTOCOLS",
-            "WM_DELETE_WINDOW",
-            "_NET_WM_SYNC_REQUEST",
-            "_NET_WM_SYNC_REQUEST_COUNTER",
-            "_NET_WM_NAME",
-            "_NET_WM_PID",
-            "_NET_WM_WINDOW_OPACITY",
-            "_NET_WM_STATE",
-            "_NET_WM_STATE_FULLSCREEN",
-            "_NET_WM_STATE_MAXIMIZED_VERT",
-            "_NET_WM_STATE_MAXIMIZED_HORZ",
-            "_MOTIF_WM_HINTS",
-            "UTF8_STRING",
-            "CLIPBOARD",
-            "PRIMARY",
-            "TARGETS",
-            "TEXT",
-            "text/plain;charset=utf-8",
-            "INCR",
-            "RELIABILITTY_SELECTION",
-        ] {
-            let atom = connection
-                .intern_atom(false, name.as_bytes())
-                .map_err(|error| error.to_string())?
-                .reply()
-                .map_err(|error| error.to_string())?
-                .atom;
-            names.insert(name, atom);
-        }
-        Ok(Self {
-            wm_protocols: names["WM_PROTOCOLS"],
-            wm_delete_window: names["WM_DELETE_WINDOW"],
-            net_wm_sync_request: names["_NET_WM_SYNC_REQUEST"],
-            net_wm_sync_request_counter: names["_NET_WM_SYNC_REQUEST_COUNTER"],
-            net_wm_name: names["_NET_WM_NAME"],
-            net_wm_pid: names["_NET_WM_PID"],
-            net_wm_window_opacity: names["_NET_WM_WINDOW_OPACITY"],
-            net_wm_state: names["_NET_WM_STATE"],
-            net_wm_state_fullscreen: names["_NET_WM_STATE_FULLSCREEN"],
-            net_wm_state_maximized_vert: names["_NET_WM_STATE_MAXIMIZED_VERT"],
-            net_wm_state_maximized_horz: names["_NET_WM_STATE_MAXIMIZED_HORZ"],
-            motif_wm_hints: names["_MOTIF_WM_HINTS"],
-            utf8_string: names["UTF8_STRING"],
-            clipboard: names["CLIPBOARD"],
-            primary: names["PRIMARY"],
-            targets: names["TARGETS"],
-            text: names["TEXT"],
-            plain_utf8: names["text/plain;charset=utf-8"],
-            incr: names["INCR"],
-            reliabilitty_selection: names["RELIABILITTY_SELECTION"],
-        })
-    }
+fn set_title_properties(
+    connection: &RustConnection,
+    window: Window,
+    atoms: &Atoms,
+    title: &str,
+) -> Result<(), String> {
+    connection
+        .change_property8(
+            PropMode::REPLACE,
+            window,
+            xproto::AtomEnum::WM_NAME,
+            xproto::AtomEnum::STRING,
+            title.as_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .change_property8(
+            PropMode::REPLACE,
+            window,
+            atoms._NET_WM_NAME,
+            atoms.UTF8_STRING,
+            title.as_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn set_opacity_property(
+    connection: &RustConnection,
+    window: Window,
+    atoms: &Atoms,
+    opacity: f32,
+) -> Result<(), String> {
+    let value = (opacity.clamp(0.0, 1.0) * u32::MAX as f32) as u32;
+    connection
+        .change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms._NET_WM_WINDOW_OPACITY,
+            xproto::AtomEnum::CARDINAL,
+            &[value],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn size_hints(padding: Padding, cell_width: u16, cell_height: u16, gutter: u16) -> WmSizeHints {

@@ -53,24 +53,17 @@ where
             cli.smoke = true;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--config-file=") {
-            cli.config_file = Some(PathBuf::from(value));
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--title=") {
-            cli.title = Some(value.to_string());
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--class=") {
-            cli.class = Some(value.to_string());
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--instance=") {
-            cli.instance = Some(value.to_string());
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--working-directory=") {
-            cli.working_directory = Some(PathBuf::from(value));
+        if arg.starts_with('-')
+            && let Some((flag, value)) = arg.split_once('=')
+        {
+            match flag {
+                "--config-file" => cli.config_file = Some(PathBuf::from(value)),
+                "--title" => cli.title = Some(value.to_string()),
+                "--class" => cli.class = Some(value.to_string()),
+                "--instance" => cli.instance = Some(value.to_string()),
+                "--working-directory" => cli.working_directory = Some(PathBuf::from(value)),
+                _ => return Err(format!("unknown option {arg}")),
+            }
             continue;
         }
         let option = match arg.as_str() {

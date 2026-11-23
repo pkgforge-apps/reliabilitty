@@ -3,49 +3,36 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use x11rb::connection::Connection as _;
 use xkeysym::{Keysym, key};
 
 use crate::cli::Cli;
-use crate::config::{Config, Padding};
+use crate::config::{Config, Dimensions, Padding};
 use crate::input::{Action, Bindings, Composer, Mods, encode_key, encode_kitty_key};
 use crate::pty::Pty;
 use crate::render::{Canvas, Renderer, pixel};
-use crate::scale;
 use crate::scrollbar;
 use crate::signals::Signals;
 use crate::theme::Theme;
 use crate::vt::{CursorStyle, Damage, Parser, SelectionMode, Terminal};
-use crate::x11::{UiEvent, X11};
+use crate::x11::{self, UiEvent, X11};
 
-fn window_pixels(config: &Config, cell_width: u16, cell_height: u16) -> (u16, u16) {
-    let columns = if config.window.dimensions.columns == 0 {
-        80
-    } else {
-        config.window.dimensions.columns
-    };
-    let lines = if config.window.dimensions.lines == 0 {
-        24
-    } else {
-        config.window.dimensions.lines
-    };
-    let padding = config.window.padding;
-    (
-        columns
-            .saturating_mul(cell_width)
-            .saturating_add(padding.x.saturating_mul(2))
-            .max(1),
-        lines
-            .saturating_mul(cell_height)
-            .saturating_add(padding.y.saturating_mul(2))
-            .max(1),
-    )
+struct PtyStream {
+    buffer: Mutex<Vec<u8>>,
+    eof: AtomicBool,
+}
+
+impl PtyStream {
+    fn new() -> Self {
+        Self {
+            buffer: Mutex::new(Vec::with_capacity(65536)),
+            eof: AtomicBool::new(false),
+        }
+    }
 }
 
 struct Drag {
@@ -87,7 +74,8 @@ struct App {
     config_modified: Option<SystemTime>,
     x11: X11,
     pty: Pty,
-    pty_rx: mpsc::Receiver<Vec<u8>>,
+    pty_stream: Arc<PtyStream>,
+    pty_scratch: Vec<u8>,
     pty_wake: OwnedFd,
     reader_stop: Arc<AtomicBool>,
     terminal: Terminal,
@@ -119,6 +107,7 @@ struct App {
     bell_until: Option<Instant>,
     redraw_all: bool,
     next_frame: Instant,
+    base_frame_interval: Duration,
     frame_interval: Duration,
     resize_settle_at: Option<Instant>,
     pending_resize: Option<(u16, u16)>,
@@ -147,13 +136,11 @@ pub fn run(cli: Cli) -> Result<(), String> {
         .and_then(|path| std::fs::metadata(path).ok())
         .and_then(|metadata| metadata.modified().ok());
     let theme = Theme::from_config(&config.colors)?;
+    let (connection, screen_number) = x11::connect()?;
     let dpi = if config.font.dpi > 0.0 {
         config.font.dpi
-    } else if let Ok((connection, screen)) = x11rb::connect(None) {
-        let root = connection.setup().roots[screen].root;
-        scale::detect(&connection, root)
     } else {
-        scale::BASE_DPI
+        X11::detect_dpi(&connection, screen_number)
     };
     // Show the window with its background before scanning fonts, which is
     // the slowest part of startup. Cell metrics are corrected once fonts load.
@@ -166,16 +153,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         .font
         .cell_height
         .unwrap_or_else(|| size_px.round().max(1.0) as u16);
-    let columns = if config.window.dimensions.columns == 0 {
-        80
-    } else {
-        config.window.dimensions.columns
-    };
-    let lines = if config.window.dimensions.lines == 0 {
-        24
-    } else {
-        config.window.dimensions.lines
-    };
+    let (columns, lines) = config.window.dimensions.resolved();
     let title = cli
         .title
         .clone()
@@ -189,6 +167,8 @@ pub fn run(cli: Cli) -> Result<(), String> {
         .clone()
         .unwrap_or_else(|| config.window.class.clone());
     let mut x11 = X11::new(
+        connection,
+        screen_number,
         &config.window,
         &title,
         &instance,
@@ -217,8 +197,14 @@ pub fn run(cli: Cli) -> Result<(), String> {
     renderer.set_cursor_options(config.cursor.thickness, config.cursor.unfocused_hollow);
     cell_width = renderer.cell_width();
     cell_height = renderer.cell_height();
+    let gutter = scrollbar::width(cell_width);
     {
-        let (width, height) = window_pixels(&config, cell_width, cell_height);
+        let (width, height) = config.window.dimensions.window_pixels(
+            config.window.padding,
+            cell_width,
+            cell_height,
+            gutter,
+        );
         if (x11.width(), x11.height()) != (width, height) {
             x11.resize_window(width, height)?;
             x11.set_size(width, height);
@@ -227,12 +213,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
             canvas.fill(pixel(&canvas, theme.background, x11.background_alpha()));
         }
     }
-    x11.set_size_hints(
-        config.window.padding,
-        cell_width,
-        cell_height,
-        scrollbar::width(cell_width),
-    )?;
+    x11.set_size_hints(config.window.padding, cell_width, cell_height, gutter)?;
 
     let cursor_style = parse_cursor_style(&config.cursor.style);
     let mut terminal = Terminal::new(
@@ -261,7 +242,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         x11.window_id(),
     )
     .map_err(|error| format!("cannot start the shell: {error}"))?;
-    let (pty_tx, pty_rx) = mpsc::sync_channel::<Vec<u8>>(256);
+    let pty_stream = Arc::new(PtyStream::new());
     let reader_fd = pty.dup_reader().map_err(|error| error.to_string())?;
     // SAFETY: eventfd returns a fresh descriptor or -1.
     let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -279,7 +260,16 @@ pub fn run(cli: Cli) -> Result<(), String> {
     let thread_wake = unsafe { OwnedFd::from_raw_fd(thread_wake) };
     let reader_stop = Arc::new(AtomicBool::new(false));
     let stop = reader_stop.clone();
+    let stream = pty_stream.clone();
     std::thread::spawn(move || {
+        const MAX_BUFFERED: usize = 16 * 1024 * 1024;
+        let signal_wake = |fd: i32| {
+            let token: u64 = 1;
+            // SAFETY: fd is a valid eventfd and token is 8 bytes.
+            unsafe {
+                libc::write(fd, &token as *const u64 as *const libc::c_void, 8);
+            }
+        };
         let mut pfd = libc::pollfd {
             fd: reader_fd.as_raw_fd(),
             events: libc::POLLIN,
@@ -293,11 +283,15 @@ pub fn run(cli: Cli) -> Result<(), String> {
             // SAFETY: pfd and count are valid.
             let result = unsafe { libc::poll(&mut pfd, 1, 100) };
             if result < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
                 break;
             }
             if result == 0 {
                 continue;
             }
+            let mut eof = false;
             loop {
                 // SAFETY: buffer length is valid.
                 let count = unsafe {
@@ -308,36 +302,60 @@ pub fn run(cli: Cli) -> Result<(), String> {
                     )
                 };
                 if count == 0 {
-                    return;
-                }
-                if count < 0 {
+                    eof = true;
                     break;
                 }
-                if pty_tx.send(buffer[..count as usize].to_vec()).is_err() {
-                    return;
+                if count < 0 {
+                    let error = std::io::Error::last_os_error();
+                    match error.kind() {
+                        std::io::ErrorKind::Interrupted => continue,
+                        std::io::ErrorKind::WouldBlock => break,
+                        _ if error.raw_os_error() == Some(libc::EIO) => {
+                            eof = true;
+                            break;
+                        }
+                        _ => {
+                            eof = true;
+                            break;
+                        }
+                    }
                 }
-                let token: u64 = 1;
-                // SAFETY: thread_wake is a valid eventfd and token is 8 bytes.
-                unsafe {
-                    libc::write(
-                        thread_wake.as_raw_fd(),
-                        &token as *const u64 as *const libc::c_void,
-                        8,
-                    );
+                let mut should_backpressure = false;
+                let should_wake = {
+                    let mut guard = stream.buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    let was_empty = guard.is_empty();
+                    guard.extend_from_slice(&buffer[..count as usize]);
+                    if guard.len() >= MAX_BUFFERED {
+                        should_backpressure = true;
+                    }
+                    was_empty
+                };
+                if should_wake {
+                    signal_wake(thread_wake.as_raw_fd());
                 }
+                if should_backpressure {
+                    // Yield briefly so the main thread drains before growing unboundedly.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            if eof {
+                stream.eof.store(true, Ordering::Release);
+                signal_wake(thread_wake.as_raw_fd());
+                return;
             }
         }
     });
     let bindings = Bindings::new(&config.keyboard)?;
     let now = Instant::now();
-    let frame_interval = x11.frame_interval();
+    let base_frame_interval = x11.frame_interval();
     let mut app = App {
         config,
         config_path,
         config_modified,
         x11,
         pty,
-        pty_rx,
+        pty_stream,
+        pty_scratch: Vec::with_capacity(65536),
         pty_wake,
         reader_stop,
         terminal,
@@ -369,7 +387,8 @@ pub fn run(cli: Cli) -> Result<(), String> {
         bell_until: None,
         redraw_all: true,
         next_frame: now,
-        frame_interval,
+        base_frame_interval,
+        frame_interval: base_frame_interval,
         resize_settle_at: None,
         pending_resize: None,
         resize_indicator_until: None,
@@ -412,7 +431,7 @@ impl App {
             self.frame_interval = self
                 .x11
                 .sync_frame_interval()
-                .unwrap_or_else(|| self.x11.frame_interval());
+                .unwrap_or(self.base_frame_interval);
             if let Some((width, height)) = self.pending_resize.take() {
                 self.x11.set_size(width, height);
                 self.resize_to_window(true);
@@ -480,12 +499,10 @@ impl App {
             .is_some_and(|deadline| now >= deadline)
         {
             self.resize_settle_at = None;
-            let background = pixel(
-                &self.canvas,
-                self.terminal.theme().background,
-                self.x11.background_alpha(),
-            );
-            self.canvas.compact_stride(background);
+            let background = self.background_pixel();
+            if self.canvas.compact_stride(background) {
+                self.x11.reset_shm();
+            }
             self.terminal.finish_deferred_resize();
         }
         if self
@@ -701,21 +718,17 @@ impl App {
         }
     }
 
+    fn request_paste(&mut self, primary: bool, time: u32) {
+        if let Err(error) = self.x11.request_paste(primary, time.max(1)) {
+            eprintln!("rtty: paste: {error}");
+        }
+    }
+
     fn perform_action(&mut self, action: Action, time: u32) {
         match action {
             Action::Copy => self.copy_selection(true),
-            Action::Paste => {
-                let time = time.max(1);
-                if let Err(error) = self.x11.request_paste(false, time) {
-                    eprintln!("rtty: paste: {error}");
-                }
-            }
-            Action::PasteSelection => {
-                let time = time.max(1);
-                if let Err(error) = self.x11.request_paste(true, time) {
-                    eprintln!("rtty: paste: {error}");
-                }
-            }
+            Action::Paste => self.request_paste(false, time),
+            Action::PasteSelection => self.request_paste(true, time),
             Action::ScrollPageUp => self.terminal.scroll_page(true),
             Action::ScrollPageDown => self.terminal.scroll_page(false),
             Action::ScrollLineUp => self.terminal.scroll(-1),
@@ -904,15 +917,10 @@ impl App {
 
     fn perform_menu_item(&mut self, item: MenuItem, time: u32) {
         match item {
-            MenuItem::Copy => self.copy_selection(true),
-            MenuItem::Paste => {
-                let time = time.max(1);
-                if let Err(error) = self.x11.request_paste(false, time) {
-                    eprintln!("rtty: paste: {error}");
-                }
-            }
+            MenuItem::Copy => self.perform_action(Action::Copy, time),
+            MenuItem::Paste => self.perform_action(Action::Paste, time),
             MenuItem::SelectAll => {
-                self.terminal.select_all();
+                self.perform_action(Action::SelectAll, time);
                 self.redraw_all = true;
             }
             MenuItem::Search => self.open_search(),
@@ -1030,10 +1038,7 @@ impl App {
             }
             2 => {
                 if pressed {
-                    let time = time.max(1);
-                    if let Err(error) = self.x11.request_paste(true, time) {
-                        eprintln!("rtty: paste: {error}");
-                    }
+                    self.request_paste(true, time);
                 }
             }
             3 if pressed => self.open_context_menu(x, y),
@@ -1170,19 +1175,27 @@ impl App {
     }
 
     fn read_pty(&mut self) -> bool {
-        let mut read_any = false;
-        for _ in 0..256 {
-            match self.pty_rx.try_recv() {
-                Ok(chunk) => {
-                    read_any = true;
-                    self.parser.advance(&chunk, &mut self.terminal);
-                }
-                Err(TryRecvError::Empty) => return read_any,
-                Err(TryRecvError::Disconnected) => {
-                    self.pty_eof = true;
-                    return read_any;
-                }
+        self.pty_scratch.clear();
+        {
+            let mut guard = self
+                .pty_stream
+                .buffer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !guard.is_empty() {
+                std::mem::swap(&mut *guard, &mut self.pty_scratch);
             }
+        }
+        let read_any = !self.pty_scratch.is_empty();
+        if read_any {
+            self.parser.advance(&self.pty_scratch, &mut self.terminal);
+            // Release unusually large bursts so idle RSS stays bounded.
+            if self.pty_scratch.capacity() > 512 * 1024 {
+                self.pty_scratch = Vec::with_capacity(65536);
+            }
+        }
+        if self.pty_stream.eof.load(Ordering::Acquire) {
+            self.pty_eof = true;
         }
         read_any
     }
@@ -1269,12 +1282,16 @@ impl App {
 
     fn resize_request(&mut self) {
         if let Some((cols, rows)) = self.terminal.take_resize_request() {
-            let width = (cols as u16)
-                .saturating_mul(self.cell_width)
-                .saturating_add(self.padding.x.saturating_mul(2));
-            let height = (rows as u16)
-                .saturating_mul(self.cell_height)
-                .saturating_add(self.padding.y.saturating_mul(2));
+            let dims = Dimensions {
+                columns: cols.min(u16::MAX as usize) as u16,
+                lines: rows.min(u16::MAX as usize) as u16,
+            };
+            let (width, height) = dims.window_pixels(
+                self.padding,
+                self.cell_width,
+                self.cell_height,
+                scrollbar::width(self.cell_width),
+            );
             if let Err(error) = self.x11.resize_window(width, height) {
                 eprintln!("rtty: resize: {error}");
             }
@@ -1377,13 +1394,45 @@ impl App {
         }
     }
 
+    fn background_pixel(&self) -> u32 {
+        pixel(
+            &self.canvas,
+            self.terminal.theme().background,
+            self.x11.background_alpha(),
+        )
+    }
+
+    fn fast_resize_allowed(&self) -> bool {
+        !self.terminal.has_selection()
+            && self.search.is_none()
+            && self.context_menu.is_none()
+            && self.bell_until.is_none()
+    }
+
+    fn cursor_on(&self) -> bool {
+        !self.focused || !self.cursor_blinking() || self.blink_on
+    }
+
+    fn finish_frame(&mut self, damage: Damage) {
+        self.terminal.recycle_damage(damage);
+        self.rendered_once = true;
+        if self.smoke && self.rendered_once {
+            self.quit = true;
+        }
+    }
+
     fn resize_to_window(&mut self, from_configure: bool) {
         let width = self.x11.width().max(1);
         let height = self.x11.height().max(1);
+        let old_padding = self.padding;
+        let old_cols = self.terminal.width();
+        let old_rows = self.terminal.height();
+        let old_indicator =
+            self.indicator_rect_for(self.canvas.width, self.canvas.height, old_cols, old_rows);
         let base = self.config.window.padding;
         let (mut pad_x, mut pad_y) = (base.x, base.y);
+        let gutter = scrollbar::width(self.cell_width);
         if self.config.window.dynamic_padding {
-            let gutter = scrollbar::width(self.cell_width);
             let available = width
                 .saturating_sub(base.x.saturating_mul(2))
                 .saturating_sub(gutter)
@@ -1397,7 +1446,7 @@ impl App {
             pad_y = height.saturating_sub(used) / 2;
         }
         self.padding = Padding { x: pad_x, y: pad_y };
-        let gutter = scrollbar::width(self.cell_width);
+        let padding_changed = old_padding.x != pad_x || old_padding.y != pad_y;
         let cols = width
             .saturating_sub(pad_x.saturating_mul(2))
             .saturating_sub(gutter)
@@ -1407,23 +1456,34 @@ impl App {
             / self.cell_height.max(1) as usize;
         let cols = cols.max(1);
         let rows = rows.max(1);
-        let grid_changed = cols != self.terminal.width() || rows != self.terminal.height();
+        let grid_changed = cols != old_cols || rows != old_rows;
+        let fast = from_configure && !padding_changed && self.fast_resize_allowed();
         if grid_changed {
-            let old_cols = self.terminal.width();
-            let old_rows = self.terminal.height();
             let old_cursor = (self.terminal.cursor.x, self.terminal.cursor.y);
-            if from_configure {
+            if fast {
                 // resize_line only pads or truncates cells; it never rewraps.
                 // The visible glyphs are therefore identical before and after
                 // a grid change, so a full redraw would repaint the same
-                // pixels. Erase only the two overlays whose geometry depends
-                // on cols/rows and let the fast path redraw them.
-                let background = pixel(
-                    &self.canvas,
-                    self.terminal.theme().background,
-                    self.x11.background_alpha(),
-                );
+                // pixels. Erase only the overlays and newly orphaned edges.
+                let background = self.background_pixel();
                 let mut rects = self.overlay_rects_for(old_cols, old_rows, old_cursor);
+                let (ox, oy) = self.origin();
+                let cw = self.cell_width as i32;
+                let ch = self.cell_height as i32;
+                if cols < old_cols {
+                    let x0 = (ox + cols as i32 * cw).max(0) as u16;
+                    let x1 = (ox + old_cols as i32 * cw).max(0) as u16;
+                    if x1 > x0 {
+                        rects.push((x0, 0, x1 - x0, height));
+                    }
+                }
+                if rows < old_rows {
+                    let y0 = (oy + rows as i32 * ch).max(0) as u16;
+                    let y1 = (oy + old_rows as i32 * ch).max(0) as u16;
+                    if y1 > y0 {
+                        rects.push((0, y0, width, y1 - y0));
+                    }
+                }
                 for &(x, y, w, h) in &rects {
                     self.canvas
                         .fill_rect(x as i32, y as i32, w as i32, h as i32, background);
@@ -1459,17 +1519,7 @@ impl App {
         if self.canvas.width != width || self.canvas.height != height {
             let old_width = self.canvas.width;
             let old_height = self.canvas.height;
-            let old_indicator = self.indicator_rect(old_width, old_height);
-            let background = pixel(
-                &self.canvas,
-                self.terminal.theme().background,
-                self.x11.background_alpha(),
-            );
-            let fast = from_configure
-                && !self.terminal.has_selection()
-                && self.search.is_none()
-                && self.context_menu.is_none()
-                && self.bell_until.is_none();
+            let background = self.background_pixel();
             let had_indicator = self.resize_indicator_until.is_some();
             if fast && had_indicator {
                 // The badge is baked into the buffer; wipe it before rows move.
@@ -1482,6 +1532,9 @@ impl App {
                 );
             }
             let repacked = self.canvas.ensure_stride(width, background);
+            if repacked || self.canvas.stride != width {
+                self.resize_settle_at = Some(Instant::now() + Duration::from_millis(100));
+            }
             self.canvas.resize(width, height, background);
             self.canvas.argb = self.x11.is_argb();
             if repacked {
@@ -1495,7 +1548,7 @@ impl App {
                 if had_indicator {
                     rects.push(old_indicator);
                 }
-                rects.push(self.indicator_rect(width, height));
+                rects.push(self.indicator_rect_for(width, height, cols, rows));
                 if width > old_width {
                     rects.push((old_width, 0, width - old_width, height));
                 }
@@ -1530,8 +1583,7 @@ impl App {
     ) -> Vec<(u16, u16, u16, u16)> {
         let cw = self.cell_width as i32;
         let ch = self.cell_height as i32;
-        let px = self.padding.x as i32;
-        let py = self.padding.y as i32;
+        let (px, py) = self.origin();
         let mut rects = Vec::new();
         if self.terminal.scrollback_len() > 0 {
             let x = px + cols as i32 * cw + 1;
@@ -1552,14 +1604,20 @@ impl App {
         rects
     }
 
-    fn indicator_rect(&self, width: u16, height: u16) -> (u16, u16, u16, u16) {
+    fn indicator_text(cols: usize, rows: usize) -> String {
+        format!("{cols} \u{d7} {rows}")
+    }
+
+    fn indicator_rect_for(
+        &self,
+        width: u16,
+        height: u16,
+        cols: usize,
+        rows: usize,
+    ) -> (u16, u16, u16, u16) {
         let cell_width = self.cell_width as i32;
         let cell_height = self.cell_height as i32;
-        let text = format!(
-            "{} \u{d7} {}",
-            self.terminal.width(),
-            self.terminal.height()
-        );
+        let text = Self::indicator_text(cols, rows);
         let w = (text.width() as i32 + 2) * cell_width;
         let h = cell_height + 8;
         let margin = (cell_width / 2).max(8);
@@ -1578,13 +1636,12 @@ impl App {
         if self.resize_indicator_until.is_none() {
             return;
         }
-        let (x, y, width, height) = self.indicator_rect(self.canvas.width, self.canvas.height);
+        let cols = self.terminal.width();
+        let rows = self.terminal.height();
+        let (x, y, width, height) =
+            self.indicator_rect_for(self.canvas.width, self.canvas.height, cols, rows);
         let cell_width = self.cell_width as i32;
-        let text = format!(
-            "{} \u{d7} {}",
-            self.terminal.width(),
-            self.terminal.height()
-        );
+        let text = Self::indicator_text(cols, rows);
         let (fill, foreground) = {
             let theme = self.terminal.theme();
             (theme.selection_background, theme.selection_foreground)
@@ -1654,10 +1711,7 @@ impl App {
         let background = pixel(&self.canvas, background, 255);
         let border = pixel(&self.canvas, border, 255);
         self.canvas.fill_rect(x, y, width, height, background);
-        self.canvas.fill_rect(x, y, width, 1, border);
-        self.canvas.fill_rect(x, y + height - 1, width, 1, border);
-        self.canvas.fill_rect(x, y, 1, height, border);
-        self.canvas.fill_rect(x + width - 1, y, 1, height, border);
+        self.canvas.stroke_rect(x, y, width, height, border);
         self.renderer.draw_label(
             &mut self.canvas,
             &display,
@@ -1706,10 +1760,7 @@ impl App {
             self.renderer
                 .draw_label(&mut self.canvas, label, x + cell_width, row_y, color);
         }
-        self.canvas.fill_rect(x, y, width, 1, border);
-        self.canvas.fill_rect(x, y + height - 1, width, 1, border);
-        self.canvas.fill_rect(x, y, 1, height, border);
-        self.canvas.fill_rect(x + width - 1, y, 1, height, border);
+        self.canvas.stroke_rect(x, y, width, height, border);
     }
 
     fn cursor_damage(&mut self) {
@@ -1738,20 +1789,13 @@ impl App {
             && !self.redraw_all
             && !extra_damage
             && damage.is_empty()
-            && self.bell_until.is_none()
-            && self.search.is_none()
-            && self.context_menu.is_none()
-            && !self.terminal.has_selection();
+            && self.fast_resize_allowed();
         if fast_ok {
             if redraw_overlays {
                 // An empty damage makes Renderer::draw skip its clear and row
                 // loop but still draw the scrollbar and cursor, whose position
                 // depends on the new grid size.
-                let cursor_on = if self.focused {
-                    !self.cursor_blinking() || self.blink_on
-                } else {
-                    true
-                };
+                let cursor_on = self.cursor_on();
                 let (origin_x, origin_y) = self.origin();
                 self.renderer.draw(
                     &mut self.canvas,
@@ -1774,11 +1818,7 @@ impl App {
                         .present(&self.canvas, &damage, self.cell_height, origin_y);
                 }
             }
-            self.terminal.recycle_damage(damage);
-            self.rendered_once = true;
-            if self.smoke && self.rendered_once {
-                self.quit = true;
-            }
+            self.finish_frame(damage);
             return;
         }
         if fast {
@@ -1795,11 +1835,7 @@ impl App {
             self.terminal.recycle_damage(damage);
             return;
         }
-        let cursor_on = if self.focused {
-            !self.cursor_blinking() || self.blink_on
-        } else {
-            true
-        };
+        let cursor_on = self.cursor_on();
         let (origin_x, origin_y) = self.origin();
         // An overlay stays in place while the terminal scrolls, so the canvas
         // shift would leave a stale copy behind. Redraw everything instead.
@@ -1811,11 +1847,7 @@ impl App {
         // cell. Presentation still needs the whole canvas since it all moved.
         let scroll = if damage.all { 0 } else { damage.scroll };
         if scroll != 0 {
-            let background = pixel(
-                &self.canvas,
-                self.terminal.theme().background,
-                self.x11.background_alpha(),
-            );
+            let background = self.background_pixel();
             self.canvas
                 .scroll_rows(scroll, self.cell_height as i32, background);
         }
@@ -1841,11 +1873,7 @@ impl App {
         }
         self.x11
             .present(&self.canvas, &present_damage, self.cell_height, origin_y);
-        self.terminal.recycle_damage(present_damage);
-        self.rendered_once = true;
-        if self.smoke && self.rendered_once {
-            self.quit = true;
-        }
+        self.finish_frame(present_damage);
     }
 
     fn wait(&mut self, now: Instant) -> Result<(), String> {
@@ -1887,6 +1915,11 @@ impl App {
                 millis.clamp(1, i32::MAX as u128) as i32
             })
             .unwrap_or(-1);
+        let pty_fd = if self.pty.has_pending() {
+            self.pty.fd()
+        } else {
+            -1
+        };
         let mut fds = [
             libc::pollfd {
                 fd: self.x11.fd(),
@@ -1894,13 +1927,8 @@ impl App {
                 revents: 0,
             },
             libc::pollfd {
-                fd: self.pty.fd(),
-                events: libc::POLLIN
-                    | if self.pty.has_pending() {
-                        libc::POLLOUT
-                    } else {
-                        0
-                    },
+                fd: pty_fd,
+                events: libc::POLLOUT,
                 revents: 0,
             },
             libc::pollfd {

@@ -1,7 +1,7 @@
 //! Escape and control sequence dispatch.
 
 use super::{Attrs, Cell, Color, MouseEncoding, MouseMode, Terminal, base64_decode};
-use crate::config::parse_color;
+use crate::config::{hex_nibble, parse_color};
 
 impl Terminal {
     pub(super) fn set_indexed_fg(&mut self, index: u8) {
@@ -45,11 +45,10 @@ impl Terminal {
                         for cell in line.cells.iter_mut().take(cols) {
                             *cell = Cell {
                                 ch: 'E',
-                                extra: 0,
+                                meta: 0,
                                 fg,
                                 bg,
                                 attrs,
-                                link: 0,
                                 width: 1,
                             };
                         }
@@ -356,8 +355,14 @@ impl Terminal {
                 self.set_cursor(0, 0);
             }
             7 => self.autowrap = enable,
-            12 => self.cursor.blinking = enable,
-            25 => self.cursor.visible = enable,
+            12 => {
+                self.cursor.blinking = enable;
+                self.mark_cursor_dirty();
+            }
+            25 => {
+                self.cursor.visible = enable;
+                self.mark_cursor_dirty();
+            }
             47 => self.set_alternate(enable, false),
             66 => self.app_keypad = enable,
             1000 => self.set_mouse_mode(MouseMode::Button, enable),
@@ -380,7 +385,6 @@ impl Terminal {
             9 => self.set_mouse_mode(MouseMode::X10, enable),
             _ => {}
         }
-        self.mark_all();
     }
 
     fn set_mode(&mut self, mode: u32, enable: bool) {
@@ -510,6 +514,7 @@ impl Terminal {
         let text = String::from_utf8_lossy(rest);
         let parts: Vec<&str> = text.split(';').collect();
         let mut index = 0;
+        let mut changed = false;
         while index + 1 < parts.len() {
             let Ok(slot) = parts[index].parse::<u8>() else {
                 index += 2;
@@ -529,10 +534,13 @@ impl Terminal {
                 );
             } else if let Ok(color) = parse_color(value) {
                 self.theme.palette[slot as usize] = color;
+                changed = true;
             }
             index += 2;
         }
-        self.mark_all();
+        if changed {
+            self.mark_all();
+        }
     }
 
     fn osc_default_color(&mut self, rest: &[u8], which: u8) {
@@ -623,7 +631,6 @@ impl Terminal {
             self.scroll_bottom = bottom;
             let y = if self.origin_mode { top } else { 0 };
             self.set_cursor(0, y);
-            self.mark_all();
         }
     }
 
@@ -639,7 +646,7 @@ impl Terminal {
         };
         self.cursor.style = style;
         self.cursor.blinking = blinking;
-        self.mark_all();
+        self.mark_cursor_dirty();
     }
 
     fn erase_display(&mut self, mode: u32) {
@@ -810,8 +817,8 @@ fn decode_hex(data: &[u8]) -> Option<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(data.len() / 2);
     for pair in data.chunks(2) {
-        let high = hex_value(pair[0])?;
-        let low = hex_value(pair[1])?;
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
         out.push((high << 4) | low);
     }
     Some(out)
@@ -825,13 +832,4 @@ fn encode_hex(data: &[u8]) -> String {
         out.push(HEX[(byte & 15) as usize] as char);
     }
     out
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }

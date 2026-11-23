@@ -123,19 +123,27 @@ fn randr_dpi(connection: &RustConnection, root: Window) -> Option<f32> {
         .ok()?
         .reply()
         .ok()?;
-    for output in resources.outputs {
-        let info = connection
-            .randr_get_output_info(output, resources.config_timestamp)
-            .ok()?
-            .reply()
-            .ok()?;
+    let cookies: Vec<_> = resources
+        .outputs
+        .iter()
+        .filter_map(|&output| {
+            connection
+                .randr_get_output_info(output, resources.config_timestamp)
+                .ok()
+                .map(|cookie| (output, cookie))
+        })
+        .collect();
+    for (output, cookie) in cookies {
+        let Ok(info) = cookie.reply() else {
+            continue;
+        };
         if info.connection == randr::Connection::CONNECTED {
             let reply = connection
                 .get_property(false, output, dpi_atom, xproto::AtomEnum::INTEGER, 0, 1)
                 .ok()?
                 .reply()
                 .ok()?;
-            if reply.format == 32 && !reply.value.is_empty() {
+            if reply.format == 32 && reply.value.len() >= 4 {
                 let little = connection.setup().image_byte_order == xproto::ImageOrder::LSB_FIRST;
                 let dpi = read_u32(&reply.value[..4], little) as f32;
                 if dpi > 0.0 {
@@ -179,8 +187,10 @@ pub fn detect(connection: &RustConnection, root: Window) -> f32 {
         return dpi.clamp(48.0, 384.0);
     }
 
-    let settings_atom = atom(connection, "_XSETTINGS_SETTINGS");
-    let xsettings_owner_atom = atom(connection, "_XSETTINGS_S0");
+    let settings_cookie = connection.intern_atom(false, b"_XSETTINGS_SETTINGS").ok();
+    let owner_cookie = connection.intern_atom(false, b"_XSETTINGS_S0").ok();
+    let settings_atom = settings_cookie.and_then(|c| c.reply().ok()).map(|r| r.atom);
+    let xsettings_owner_atom = owner_cookie.and_then(|c| c.reply().ok()).map(|r| r.atom);
     let mut settings = Vec::new();
     if let (Some(owner_atom), Some(settings_atom)) = (xsettings_owner_atom, settings_atom) {
         if let Ok(reply) = connection.get_selection_owner(owner_atom) {

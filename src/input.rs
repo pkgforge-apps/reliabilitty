@@ -142,7 +142,6 @@ fn default_bindings() -> Vec<Binding> {
     add("Up", "Control|Shift", Action::ScrollLineUp);
     add("Down", "Control|Shift", Action::ScrollLineDown);
     add("Equal", "Control|Shift", Action::IncreaseFontSize);
-    add("Plus", "Control|Shift", Action::IncreaseFontSize);
     add("Minus", "Control|Shift", Action::DecreaseFontSize);
     add("0", "Control|Shift", Action::ResetFontSize);
     add("F11", "", Action::ToggleFullscreen);
@@ -214,8 +213,8 @@ pub fn normalize_key(name: &str) -> String {
     let canonical = match lower.as_str() {
         "esc" => "escape",
         "enter" => "return",
-        "pageup" | "pgup" => "pageup",
-        "pagedown" | "pgdn" => "pagedown",
+        "pageup" | "pgup" | "prior" => "pageup",
+        "pagedown" | "pgdn" | "next" => "pagedown",
         "backspace" | "bksp" => "backspace",
         "exclam" => "1",
         "at" => "2",
@@ -282,25 +281,7 @@ fn symbol_key(name: &str) -> Option<&'static str> {
 }
 
 fn key_name(keysym: u32) -> Option<String> {
-    let name = Keysym::new(keysym).name()?;
-    let normalized = normalize_key(name);
-    Some(match normalized.as_str() {
-        "prior" => "pageup".to_string(),
-        "next" => "pagedown".to_string(),
-        "slash" => "/".to_string(),
-        "period" => ".".to_string(),
-        "comma" => ",".to_string(),
-        "minus" => "-".to_string(),
-        "equal" => "=".to_string(),
-        "plus" => "+".to_string(),
-        "bracketleft" => "[".to_string(),
-        "bracketright" => "]".to_string(),
-        "semicolon" => ";".to_string(),
-        "apostrophe" => "'".to_string(),
-        "grave" => "`".to_string(),
-        "backslash" => "\\".to_string(),
-        other => other.to_string(),
-    })
+    Keysym::new(keysym).name().map(normalize_key)
 }
 
 #[derive(Default)]
