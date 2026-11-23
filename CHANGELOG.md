@@ -1,4 +1,10 @@
 
+## [0.1.20](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.19...v0.1.20) - 2026-11-23
+
+### Performance
+
+- Lazy font loading, chunked scrollback and drop mimalloc ([#47](https://github.com/pkgforge-apps/reliabilitty/pull/47)) - ([e1e2bd3](https://github.com/pkgforge-apps/reliabilitty/commit/e1e2bd3e00e38d64f50bb2eac26a6c1468a284f6))
+
 ## [0.1.19](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.18...v0.1.19) - 2026-11-23
 
 ### Bug Fixes
