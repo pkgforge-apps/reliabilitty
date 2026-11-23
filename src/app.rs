@@ -409,9 +409,10 @@ impl App {
             for event in events {
                 self.handle_event(event, now)?;
             }
-            if let Some(interval) = self.x11.sync_frame_interval() {
-                self.frame_interval = interval;
-            }
+            self.frame_interval = self
+                .x11
+                .sync_frame_interval()
+                .unwrap_or_else(|| self.x11.frame_interval());
             if let Some((width, height)) = self.pending_resize.take() {
                 self.x11.set_size(width, height);
                 self.resize_to_window(true);
@@ -519,13 +520,11 @@ impl App {
             UiEvent::Motion { x, y, mods, state } => self.handle_motion(x, y, mods, state, now),
             UiEvent::Resize { width, height } => self.pending_resize = Some((width, height)),
             UiEvent::Expose => {
-                // A resize repaints its own exposed edge. Honouring the
-                // accompanying Expose would force a full redraw per frame.
-                if self.pending_resize.is_none() && self.resize_indicator_until.is_none() {
-                    self.terminal.mark_all();
-                    self.redraw_all = true;
-                    self.resize_present_rects = None;
-                }
+                // The resize-induced Expose is removed in X11::poll(); any
+                // Expose reaching here is genuine (uncovered region, etc.).
+                self.terminal.mark_all();
+                self.redraw_all = true;
+                self.resize_present_rects = None;
             }
             UiEvent::Focus(focused) => {
                 self.focused = focused;
@@ -1471,7 +1470,8 @@ impl App {
                 && self.search.is_none()
                 && self.context_menu.is_none()
                 && self.bell_until.is_none();
-            if fast {
+            let had_indicator = self.resize_indicator_until.is_some();
+            if fast && had_indicator {
                 // The badge is baked into the buffer; wipe it before rows move.
                 self.canvas.fill_rect(
                     old_indicator.0 as i32,
@@ -1491,7 +1491,11 @@ impl App {
                 self.redraw_all = true;
             }
             if fast && !repacked {
-                let mut rects = vec![old_indicator, self.indicator_rect(width, height)];
+                let mut rects = Vec::with_capacity(5);
+                if had_indicator {
+                    rects.push(old_indicator);
+                }
+                rects.push(self.indicator_rect(width, height));
                 if width > old_width {
                     rects.push((old_width, 0, width - old_width, height));
                 }
