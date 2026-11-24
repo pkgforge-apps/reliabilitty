@@ -1,7 +1,7 @@
 # Maintainer: Samueru-sama xdglawyer@outlook.com
 
 pkgname=reliabilitty
-pkgver=0.1.20
+pkgver=0.1.21
 pkgrel=1
 pkgdesc="A small, fast, reliable X11 terminal emulator"
 arch=('x86_64' 'aarch64')
