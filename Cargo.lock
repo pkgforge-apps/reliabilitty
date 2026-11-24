@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "reliabilitty"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "dirs",
  "fontdb",

@@ -1,4 +1,18 @@
 
+## [0.1.21](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.20...v0.1.21) - 2026-11-24
+
+### Features
+
+- Reflow wrapped lines on resize without flicker ([#51](https://github.com/pkgforge-apps/reliabilitty/pull/51)) - ([9a95da1](https://github.com/pkgforge-apps/reliabilitty/commit/9a95da17269fcac7a16173b978166211d8ee0e51))
+
+### Documentation
+
+- Refresh benchmarks for v0.1.20 ([#49](https://github.com/pkgforge-apps/reliabilitty/pull/49)) - ([b4259df](https://github.com/pkgforge-apps/reliabilitty/commit/b4259df3a9024df3a25ac74ec9d1260b808a4938))
+
+### Miscellaneous Tasks
+
+- Add PKGBUILD for Arch Linux - ([be9746f](https://github.com/pkgforge-apps/reliabilitty/commit/be9746fd071c5d6c8d3299171b5b2050cf0f20c0))
+
 ## [0.1.20](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.19...v0.1.20) - 2026-11-23
 
 ### Performance
