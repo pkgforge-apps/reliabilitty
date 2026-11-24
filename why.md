@@ -57,6 +57,7 @@ It is meant to be a terminal emulator that you can count on to always launch!
 | Live reload | yes | yes | no | yes | yes | no | yes |
 | Configurable via env variables | yes | no | no | no | no | no | no |
 | Scrollback | yes | yes | yes | yes | yes | needs patch | yes |
+| Reflow of wrapped lines on resize | yes | yes | yes | yes | yes | no | yes |
 | Scrollbar | yes | no | no | yes | yes | needs patch | yes |
 | Truecolor | yes | yes | yes | yes | yes | needs patch | yes |
 | Transparency | yes, background | yes, whole window incl. text | yes, background | yes, background | yes, background | needs patch | yes, background |
