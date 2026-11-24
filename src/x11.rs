@@ -407,6 +407,7 @@ impl X11 {
             | EventMask::ENTER_WINDOW
             | EventMask::LEAVE_WINDOW;
         let mut attributes = xproto::CreateWindowAux::new()
+            .bit_gravity(xproto::Gravity::NORTH_WEST)
             .background_pixel(background_pixel)
             .border_pixel(0)
             .event_mask(event_mask);
@@ -1540,6 +1541,12 @@ fn set_opacity_property(
     Ok(())
 }
 
+/// Smallest grid the window may be resized to. Below this a shell prompt is
+/// taller than the viewport and cursor-up redraws cannot stay consistent with
+/// the terminal's rows.
+const MIN_COLS: i32 = 20;
+const MIN_ROWS: i32 = 5;
+
 fn size_hints(padding: Padding, cell_width: u16, cell_height: u16, gutter: u16) -> WmSizeHints {
     let base_x = padding.x as i32 * 2 + gutter as i32;
     let base_y = padding.y as i32 * 2;
@@ -1548,7 +1555,10 @@ fn size_hints(padding: Padding, cell_width: u16, cell_height: u16, gutter: u16) 
     // refresh rate. Arbitrary pixel sizes let the edge track the pointer; the
     // grid stays whole-cell and the remainder becomes background/padding.
     WmSizeHints {
-        min_size: Some((base_x + cell_width as i32, base_y + cell_height as i32)),
+        min_size: Some((
+            base_x + cell_width as i32 * MIN_COLS,
+            base_y + cell_height as i32 * MIN_ROWS,
+        )),
         ..WmSizeHints::new()
     }
 }
@@ -1668,6 +1678,6 @@ mod tests {
         let hints = size_hints(Padding { x: 2, y: 3 }, 10, 20, 12);
         assert_eq!(hints.base_size, None);
         assert_eq!(hints.size_increment, None);
-        assert_eq!(hints.min_size, Some((26, 26)));
+        assert_eq!(hints.min_size, Some((216, 106)));
     }
 }

@@ -117,6 +117,7 @@ struct App {
     redraw_overlays: bool,
     overlay_rects: Vec<(u16, u16, u16, u16)>,
     last_pty_input: Instant,
+    sync_output_since: Option<Instant>,
     smoke: bool,
     rendered_once: bool,
     quit: bool,
@@ -392,6 +393,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
         redraw_overlays: false,
         overlay_rects: Vec::new(),
         last_pty_input: now,
+        sync_output_since: None,
         smoke: cli.smoke,
         rendered_once: false,
         quit: false,
@@ -427,6 +429,7 @@ impl App {
                 .x11
                 .sync_frame_interval()
                 .unwrap_or(self.base_frame_interval);
+            let resized = self.pending_resize.is_some();
             if let Some((width, height)) = self.pending_resize.take() {
                 self.x11.set_size(width, height);
                 self.resize_to_window(true);
@@ -448,6 +451,11 @@ impl App {
                 self.last_pty_input = now;
                 self.search_stale = true;
             }
+            if self.terminal.synchronized_output() {
+                self.sync_output_since.get_or_insert(now);
+            } else {
+                self.sync_output_since = None;
+            }
             self.terminal_notifications(now);
             self.flush_input();
             self.check_child(now);
@@ -455,8 +463,14 @@ impl App {
             if self.force_reload || now >= self.next_config_check {
                 self.maybe_reload(now);
             }
+            let sync_hold = self
+                .sync_output_since
+                .is_some_and(|since| now.duration_since(since) < Duration::from_millis(100));
             let idle = now.duration_since(self.last_pty_input) >= Duration::from_millis(10);
-            if idle || now >= self.next_frame || self.x11.sync_pending() {
+            if resized
+                || (!sync_hold && (idle || now >= self.next_frame))
+                || self.x11.sync_pending()
+            {
                 self.cursor_damage();
                 self.render(now);
                 self.next_frame = now + self.frame_interval;
@@ -498,7 +512,9 @@ impl App {
             if self.canvas.compact_stride(background) {
                 self.x11.reset_shm();
             }
-            self.terminal.finish_deferred_resize();
+            if self.terminal.finish_deferred_resize() {
+                self.redraw_all = true;
+            }
         }
         if self
             .resize_indicator_until
@@ -1447,14 +1463,19 @@ impl App {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let grid_changed = cols != old_cols || rows != old_rows;
-        let fast = from_configure && !padding_changed && self.fast_resize_allowed();
+        let mut fast = from_configure && !padding_changed && self.fast_resize_allowed();
         if grid_changed {
             let old_cursor = (self.terminal.cursor.x, self.terminal.cursor.y);
-            if fast {
-                // resize_line only pads or truncates cells; it never rewraps.
-                // The visible glyphs are therefore identical before and after
-                // a grid change, so a full redraw would repaint the same
-                // pixels. Erase only the overlays and newly orphaned edges.
+            let moved = self
+                .terminal
+                .resize(cols, rows, self.cell_width, self.cell_height);
+            // Send SIGWINCH immediately. Deferring it until the drag settles
+            // makes the shell repaint its prompt late, which is visible as
+            // text lagging behind the window frame.
+            self.pty.resize(cols, rows, width as usize, height as usize);
+            if fast && !moved {
+                // No visible cells reflowed or shifted rows, so existing pixels
+                // stay valid. Erase only the overlays and orphaned edges.
                 let background = self.background_pixel();
                 let mut rects = self.overlay_rects_for(old_cols, old_rows, old_cursor);
                 let (ox, oy) = self.origin();
@@ -1478,8 +1499,6 @@ impl App {
                     self.canvas
                         .fill_rect(x as i32, y as i32, w as i32, h as i32, background);
                 }
-                self.terminal
-                    .resize(cols, rows, self.cell_width, self.cell_height);
                 let discarded = self.terminal.take_damage();
                 self.terminal.recycle_damage(discarded);
                 rects.extend(self.overlay_rects_for(
@@ -1489,14 +1508,8 @@ impl App {
                 ));
                 self.overlay_rects = rects;
                 self.redraw_overlays = true;
-                // Send SIGWINCH immediately. Deferring it until the drag
-                // settles makes the shell repaint its prompt late, which is
-                // visible as text lagging behind the window frame.
-                self.pty.resize(cols, rows, width as usize, height as usize);
             } else {
-                self.terminal
-                    .resize(cols, rows, self.cell_width, self.cell_height);
-                self.pty.resize(cols, rows, width as usize, height as usize);
+                fast = false;
                 self.terminal.mark_all();
                 self.redraw_all = true;
             }
@@ -1871,6 +1884,9 @@ impl App {
         let mut deadline = |d: Instant| {
             earliest = Some(earliest.map_or(d, |e| e.min(d)));
         };
+        if let Some(since) = self.sync_output_since {
+            deadline(since + Duration::from_millis(100));
+        }
         if self.terminal.has_damage() || self.redraw_all {
             deadline(self.last_pty_input + Duration::from_millis(10));
             deadline(self.next_frame);

@@ -382,6 +382,7 @@ impl Terminal {
             }
             1049 => self.set_alternate(enable, true),
             2004 => self.bracketed_paste = enable,
+            2026 => self.sync_output = enable,
             9 => self.set_mouse_mode(MouseMode::X10, enable),
             _ => {}
         }
@@ -409,6 +410,7 @@ impl Terminal {
             1015 => Some(self.mouse_encoding == MouseEncoding::Urxvt),
             1005 => Some(self.mouse_encoding == MouseEncoding::Utf8),
             2004 => Some(self.bracketed_paste),
+            2026 => Some(self.sync_output),
             _ => None,
         };
         let value = match state {

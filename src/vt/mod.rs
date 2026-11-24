@@ -120,6 +120,12 @@ pub struct Line {
     /// Cells, always exactly the terminal width after a resize.
     pub cells: Vec<Cell>,
     pub wrapped: bool,
+    /// Content of a hard-terminated row that did not fit after the terminal
+    /// narrowed. It is restored when the terminal widens again.
+    tail: Option<Box<LineTail>>,
+    /// True when this row is the joined result of a soft-wrapped line, so it
+    /// keeps re-wrapping instead of being clipped when the terminal narrows.
+    soft: bool,
     /// True if any wide (width != 1) cell may exist on this line.
     has_wide: bool,
     /// Columns written since the last clear. Cells outside the range are
@@ -129,12 +135,22 @@ pub struct Line {
     revision: u64,
 }
 
+/// Cells clipped off the right edge of a row that is not part of a wrapped
+/// chain. The full row content is `cells[..start]` followed by `cells`.
+#[derive(Clone, Debug)]
+struct LineTail {
+    start: usize,
+    cells: Vec<Cell>,
+}
+
 impl Line {
     fn new(id: u64, cells: Vec<Cell>) -> Self {
         Self {
             id,
             cells,
             wrapped: false,
+            tail: None,
+            soft: false,
             has_wide: false,
             written_min: usize::MAX,
             written_max: 0,
@@ -173,9 +189,23 @@ impl Line {
             self.cells[self.written_min..=self.written_max].fill(Cell::blank());
         }
         self.has_wide = false;
+        self.tail = None;
+        self.soft = false;
         self.written_min = usize::MAX;
         self.written_max = 0;
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Full content of the row including any clipped tail, without trailing
+    /// default blanks.
+    fn extend_logical(&self, out: &mut Vec<Cell>) {
+        match &self.tail {
+            Some(tail) => {
+                out.extend_from_slice(&self.cells[..tail.start.min(self.cells.len())]);
+                out.extend_from_slice(&tail.cells);
+            }
+            None => out.extend_from_slice(&self.cells[..trimmed_cell_len(&self.cells)]),
+        }
     }
 
     /// Blanks the untouched partner of any wide character overlapped at `x`
@@ -260,6 +290,7 @@ struct ScrollbackEntry {
     offset: usize,
     len: usize,
     cols: usize,
+    soft: bool,
 }
 
 /// Chunked arena for scrollback history.
@@ -303,11 +334,52 @@ impl ScrollbackStore {
         if history == 0 {
             return;
         }
+        if line.tail.is_some() {
+            let mut full = Vec::with_capacity(line.cells.len() * 2);
+            line.extend_logical(&mut full);
+            self.push_raw(line.id, &full, line.wrapped, line.revision, cols, history);
+            self.set_last_soft(line.soft);
+            return;
+        }
         // Only store up to the rightmost written column (or 0 for a blank line).
         let stored_len = if line.written_min <= line.written_max {
             (line.written_max + 1).min(line.cells.len())
         } else {
             0
+        };
+        self.push_raw(
+            line.id,
+            &line.cells[..stored_len],
+            line.wrapped,
+            line.revision,
+            cols,
+            history,
+        );
+        self.set_last_soft(line.soft);
+    }
+
+    fn set_last_soft(&mut self, soft: bool) {
+        if let Some(entry) = self.entries.back_mut() {
+            entry.soft = soft;
+        }
+    }
+
+    fn push_raw(
+        &mut self,
+        id: u64,
+        cells: &[Cell],
+        wrapped: bool,
+        revision: u64,
+        cols: usize,
+        history: usize,
+    ) {
+        if history == 0 {
+            return;
+        }
+        let stored_len = if wrapped {
+            cells.len().min(cols)
+        } else {
+            cells.len()
         };
         let (chunk, offset) = if stored_len == 0 {
             let current = self.base_chunk + self.chunks.len().saturating_sub(1);
@@ -335,22 +407,151 @@ impl ScrollbackStore {
             let chunk_id = self.base_chunk + self.chunks.len() - 1;
             let buf = self.chunks.back_mut().unwrap();
             let offset = buf.len();
-            buf.extend_from_slice(&line.cells[..stored_len]);
+            buf.extend_from_slice(&cells[..stored_len]);
             (chunk_id, offset)
         };
         self.entries.push_back(ScrollbackEntry {
-            id: line.id,
-            wrapped: line.wrapped,
-            revision: line.revision,
+            id,
+            wrapped,
+            revision,
             chunk,
             offset,
             len: stored_len,
             cols,
+            soft: false,
         });
         while self.entries.len() > history {
             self.entries.pop_front();
         }
         self.reclaim_chunks();
+    }
+
+    /// Pops the newest logical line (one or more physical scrollback rows
+    /// joined by `wrapped = true`) and returns it already rewrapped at `cols`.
+    /// This lets `reflow_main` pull lines back from scrollback during an
+    /// interactive drag in O(1) without reflowing the entire scrollback history.
+    fn pop_back_logical_reflowed(
+        &mut self,
+        cols: usize,
+        line_id_next: &mut u64,
+        next_row_starts_wide: bool,
+    ) -> Vec<Line> {
+        let Some(last) = self.entries.pop_back() else {
+            return Vec::new();
+        };
+        let trailing_wrapped = last.wrapped;
+        let mut group = vec![last];
+        while self.entries.back().is_some_and(|entry| entry.wrapped) {
+            if let Some(prev) = self.entries.pop_back() {
+                group.push(prev);
+            } else {
+                break;
+            }
+        }
+        group.reverse();
+
+        let group_soft = group.len() > 1 || group[0].soft;
+        let first_id = group[0].id;
+        let first_rev = group[0].revision.wrapping_add(1);
+        let mut logical: Vec<Cell> = Vec::with_capacity(cols * group.len());
+        for (idx, entry) in group.iter().enumerate() {
+            let raw = self.cells_of(entry);
+            if entry.wrapped {
+                let next_wide = group
+                    .get(idx + 1)
+                    .and_then(|next| self.cells_of(next).first())
+                    .map_or(next_row_starts_wide, |cell| cell.width == 2);
+                let keep = wrapped_line_content_len(raw, entry.cols, next_wide);
+                logical.extend_from_slice(&raw[..keep]);
+            } else {
+                let keep = trimmed_cell_len(raw);
+                logical.extend_from_slice(&raw[..keep]);
+            }
+        }
+        if self.entries.is_empty() {
+            self.chunks.clear();
+            self.free_chunks.clear();
+            self.base_chunk = 0;
+        }
+
+        let mut out = Vec::new();
+        if logical.is_empty() {
+            let mut line = Line::new(first_id, vec![Cell::blank(); cols]);
+            line.wrapped = trailing_wrapped;
+            line.revision = first_rev;
+            line.soft = group_soft;
+            out.push(line);
+            return out;
+        }
+        if !group_soft && !trailing_wrapped && logical.len() > cols {
+            out.push(build_clipped_line(first_id, &logical, cols, first_rev));
+            return out;
+        }
+        let mut row_start = 0usize;
+        let mut first = true;
+        while row_start < logical.len() {
+            let row_end = next_wrap_cut(&logical, row_start, cols);
+            let wrapped = row_end < logical.len() || trailing_wrapped;
+            let id = if first {
+                first = false;
+                first_id
+            } else {
+                let id = *line_id_next;
+                *line_id_next = line_id_next.wrapping_add(1);
+                id
+            };
+            let mut row =
+                build_line_from_slice(id, &logical[row_start..row_end], cols, wrapped, first_rev);
+            row.soft = group_soft;
+            out.push(row);
+            row_start = row_end;
+        }
+        out
+    }
+
+    fn pop_back_line(&mut self, cols: usize) -> Option<Line> {
+        let entry = self.entries.pop_back()?;
+        let stored = self.cells_of(&entry);
+        if !entry.wrapped && stored.len() > cols {
+            let line = build_clipped_line(entry.id, stored, cols, entry.revision);
+            if self.entries.is_empty() {
+                self.chunks.clear();
+                self.free_chunks.clear();
+                self.base_chunk = 0;
+            }
+            return Some(line);
+        }
+        let copy_len = stored.len().min(cols);
+        let mut cells = vec![Cell::blank(); cols];
+        let mut has_wide = false;
+        if copy_len > 0 {
+            cells[..copy_len].copy_from_slice(&stored[..copy_len]);
+            if copy_len == cols && cells[cols - 1].width == 2 {
+                cells[cols - 1] = Cell::blank();
+            }
+            has_wide = cells[..copy_len].iter().any(|cell| cell.width != 1);
+        }
+        let mut line = Line {
+            id: entry.id,
+            cells,
+            wrapped: entry.wrapped,
+            tail: None,
+            soft: entry.soft,
+            has_wide,
+            written_min: if copy_len > 0 { 0 } else { usize::MAX },
+            written_max: copy_len.saturating_sub(1),
+            revision: entry.revision,
+        };
+        if copy_len == 0 {
+            line.written_min = usize::MAX;
+            line.written_max = 0;
+        }
+        if self.entries.is_empty() {
+            self.chunks.clear();
+            self.free_chunks.clear();
+            self.base_chunk = 0;
+        }
+        Some(line)
     }
 
     fn reclaim_chunks(&mut self) {
@@ -386,14 +587,129 @@ impl ScrollbackStore {
         Some((entry, self.cells_of(entry)))
     }
 
-    fn resize_all(&mut self, cols: usize) {
-        for entry in &mut self.entries {
-            entry.cols = cols;
-            if entry.len > cols {
-                entry.len = cols;
-            }
-            entry.revision = entry.revision.wrapping_add(1);
+    fn reflow(
+        &mut self,
+        cols: usize,
+        history: usize,
+        line_id_next: &mut u64,
+        view_top_id: Option<u64>,
+        screen_first_wide: bool,
+    ) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
         }
+        let cols = cols.max(1);
+        let old_entries = std::mem::take(&mut self.entries);
+        let old_chunks = std::mem::take(&mut self.chunks);
+        let old_base = self.base_chunk;
+        self.base_chunk = 0;
+
+        let mut logical: Vec<Cell> = Vec::with_capacity(cols * 2);
+        let mut new_view_top: Option<usize> = None;
+        let mut index = 0;
+        while index < old_entries.len() {
+            logical.clear();
+            let first_id = old_entries[index].id;
+            let first_rev = old_entries[index].revision.wrapping_add(1);
+            let mut matched_view = false;
+            let mut trailing_wrapped = false;
+            let group_start = index;
+            let mut cursor = index;
+            loop {
+                let entry = &old_entries[cursor];
+                if Some(entry.id) == view_top_id {
+                    matched_view = true;
+                }
+                let raw = if entry.len == 0 {
+                    &[][..]
+                } else {
+                    let local = entry.chunk.saturating_sub(old_base);
+                    old_chunks
+                        .get(local)
+                        .map_or(&[][..], |buf| &buf[entry.offset..entry.offset + entry.len])
+                };
+                if entry.wrapped {
+                    let next_wide = match old_entries.get(cursor + 1) {
+                        Some(next) => {
+                            if next.len == 0 {
+                                false
+                            } else {
+                                let local = next.chunk.saturating_sub(old_base);
+                                old_chunks
+                                    .get(local)
+                                    .and_then(|buf| buf.get(next.offset))
+                                    .is_some_and(|cell| cell.width == 2)
+                            }
+                        }
+                        None => screen_first_wide,
+                    };
+                    let keep = wrapped_line_content_len(raw, entry.cols, next_wide);
+                    logical.extend_from_slice(&raw[..keep]);
+                } else {
+                    let keep = trimmed_cell_len(raw);
+                    logical.extend_from_slice(&raw[..keep]);
+                    cursor += 1;
+                    break;
+                }
+                cursor += 1;
+                if cursor >= old_entries.len() {
+                    // This logical line continues onto the first live screen row.
+                    trailing_wrapped = true;
+                    break;
+                }
+            }
+            index = cursor;
+
+            let start_entry = self.entries.len();
+            if matched_view && new_view_top.is_none() {
+                new_view_top = Some(start_entry);
+            }
+
+            if logical.is_empty() {
+                self.push_raw(first_id, &[], trailing_wrapped, first_rev, cols, usize::MAX);
+                self.set_last_soft(cursor - group_start > 1 || old_entries[group_start].soft);
+                continue;
+            }
+            let group_soft = cursor - group_start > 1 || old_entries[group_start].soft;
+            if !group_soft && !trailing_wrapped && logical.len() > cols {
+                self.push_raw(first_id, &logical, false, first_rev, cols, usize::MAX);
+                continue;
+            }
+            let mut row_start = 0usize;
+            let mut first = true;
+            while row_start < logical.len() {
+                let row_end = next_wrap_cut(&logical, row_start, cols);
+                let wrapped = row_end < logical.len() || trailing_wrapped;
+                let id = if first {
+                    first = false;
+                    first_id
+                } else {
+                    let id = *line_id_next;
+                    *line_id_next = line_id_next.wrapping_add(1);
+                    id
+                };
+                self.push_raw(
+                    id,
+                    &logical[row_start..row_end],
+                    wrapped,
+                    first_rev,
+                    cols,
+                    usize::MAX,
+                );
+                self.set_last_soft(group_soft);
+                row_start = row_end;
+            }
+        }
+
+        if self.entries.len() > history {
+            let excess = self.entries.len() - history;
+            for _ in 0..excess {
+                self.entries.pop_front();
+            }
+            new_view_top = new_view_top.map(|top| top.saturating_sub(excess));
+            self.reclaim_chunks();
+        }
+        new_view_top
     }
 }
 
@@ -420,10 +736,11 @@ impl<'a> LineView<'a> {
     }
 
     fn from_scrollback(entry: &ScrollbackEntry, cells: &'a [Cell]) -> Self {
+        let cols = entry.cols.max(1);
         Self {
             id: entry.id,
-            cells,
-            cols: entry.cols.max(1),
+            cells: &cells[..cells.len().min(cols)],
+            cols,
             wrapped: entry.wrapped,
             revision: entry.revision,
         }
@@ -622,6 +939,7 @@ pub struct Terminal {
     app_cursor: bool,
     app_keypad: bool,
     bracketed_paste: bool,
+    sync_output: bool,
     focus_events: bool,
     mouse_mode: MouseMode,
     /// Kitty keyboard protocol flags and push/pop stacks, per screen.
@@ -710,6 +1028,7 @@ impl Terminal {
             app_cursor: false,
             app_keypad: false,
             bracketed_paste: false,
+            sync_output: false,
             focus_events: false,
             mouse_mode: MouseMode::Off,
             kitty_flags: [0, 0],
@@ -859,6 +1178,11 @@ impl Terminal {
 
     pub fn cursor_visible(&self) -> bool {
         self.cursor.visible
+    }
+
+    /// True while the application has bracketed an update with DEC mode 2026.
+    pub fn synchronized_output(&self) -> bool {
+        self.sync_output
     }
 
     pub fn lines(&self) -> &VecDeque<Line> {
@@ -1639,70 +1963,478 @@ impl Terminal {
         }
     }
 
-    pub fn resize(&mut self, cols: usize, rows: usize, cell_width: u16, cell_height: u16) {
+    pub fn resize(&mut self, cols: usize, rows: usize, cell_width: u16, cell_height: u16) -> bool {
         let cols = cols.max(1);
         let rows = rows.max(1);
         self.cell_width = cell_width;
         self.cell_height = cell_height;
         if cols == self.cols && rows == self.rows {
-            return;
+            return false;
         }
         self.normalize_region();
-        let cols_changed = self.cols != cols;
+        let old_cols = self.cols;
+        let old_rows = self.rows;
+        let cols_changed = old_cols != cols;
         self.cols = cols;
         self.rows = rows;
-        for line in &mut self.main {
-            resize_line(line, cols);
-        }
+
+        let mut content_moved = false;
         if let Some(alt) = &mut self.alt {
-            for line in alt {
+            for line in alt.iter_mut() {
                 resize_line(line, cols);
             }
-        }
-        // Reflowing every scrollback line is O(history) and can take several
-        // milliseconds. Defer it until the resize settles so interactive drags
-        // stay responsive; visible lines are resized immediately above.
-        if cols_changed {
-            self.pending_scrollback_resize = true;
-        }
-        while self.main.len() < rows {
-            let line = self.new_line();
-            self.main.push_back(line);
-        }
-        self.main.truncate(rows);
-        if self.alt.as_ref().is_some_and(|alt| alt.len() < rows) {
-            let mut extra = VecDeque::new();
-            while self.alt.as_ref().map_or(0, VecDeque::len) + extra.len() < rows {
-                extra.push_back(self.new_line());
+            while alt.len() < rows {
+                let id = self.line_id_next;
+                self.line_id_next = self.line_id_next.wrapping_add(1);
+                alt.push_back(Line::new(id, vec![Cell::blank(); cols]));
             }
-            if let Some(alt) = &mut self.alt {
-                alt.extend(extra);
-            }
-        }
-        if let Some(alt) = &mut self.alt {
             alt.truncate(rows);
+            // Primary screen still reflows while alternate screen is active so
+            // returning from a TUI shows wrapped lines at the new width.
+            self.reflow_main(old_cols, old_rows, cols, rows, false);
+            self.cursor.x = self.cursor.x.min(cols - 1);
+            self.cursor.y = self.cursor.y.min(rows - 1);
+            self.scroll_offset = 0;
+            self.wrap_pending = false;
+        } else {
+            content_moved = self.reflow_main(old_cols, old_rows, cols, rows, true);
+        }
+
+        if content_moved {
+            self.selection = None;
+        }
+        if cols_changed && self.scrollback.len() > 0 {
+            self.pending_scrollback_resize = true;
         }
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
-        self.cursor.x = self.cursor.x.min(cols - 1);
-        self.cursor.y = self.cursor.y.min(rows - 1);
-        self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
         self.tabs.resize(cols, false);
         self.reset_tabs();
         self.dirty = vec![false; rows];
         self.dirty_all = true;
         self.last_printed = None;
-        self.wrap_pending = false;
+        content_moved
+    }
+
+    /// Reassigns strictly increasing line IDs across scrollback and live screen
+    /// when reflow inserts or pulls back lines, preserving the monotonic ID
+    /// invariant assumed by selection ordering and search-highlight scanning.
+    fn renumber_lines(&mut self) {
+        let mut next = 0u64;
+        for entry in &mut self.scrollback.entries {
+            entry.id = next;
+            next += 1;
+        }
+        for line in &mut self.main {
+            line.id = next;
+            next += 1;
+        }
+        if let Some(alt) = &mut self.alt {
+            for line in alt {
+                line.id = next;
+                next += 1;
+            }
+        }
+        self.line_id_next = next;
+    }
+
+    /// Reflows the primary screen (and any scrollback rows pulled back in or
+    /// pushed out by width/height changes). Returns true if any visible cell
+    /// changed position relative to the top-left of the screen.
+    fn reflow_main(
+        &mut self,
+        old_cols: usize,
+        old_rows: usize,
+        new_cols: usize,
+        new_rows: usize,
+        track_cursor: bool,
+    ) -> bool {
+        let mut moved = false;
+
+        // If the first live line is the continuation of a wrapped line at the
+        // tail of scrollback, pull that logical line back onto the live screen
+        // so reflowing sees the complete paragraph.
+        let mut pulled_prefix = 0usize;
+        if old_cols != new_cols {
+            while let Some(back) = self.scrollback.entries.back()
+                && back.wrapped
+            {
+                let entry_cols = back.cols.max(1);
+                if let Some(line) = self.scrollback.pop_back_line(entry_cols) {
+                    self.main.push_front(line);
+                    pulled_prefix += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let mut cursor_row = if track_cursor {
+            self.cursor.y.min(old_rows.saturating_sub(1)) + pulled_prefix
+        } else {
+            pulled_prefix
+        };
+        let mut cursor_col = if track_cursor {
+            self.cursor.x.min(old_cols.saturating_sub(1))
+        } else {
+            0
+        };
+        let old_cursor = (self.cursor.x, self.cursor.y);
+
+        let mut new_wrap_pending = self.wrap_pending && old_cols == new_cols;
+
+        if old_cols != new_cols {
+            let old_lines = std::mem::take(&mut self.main);
+            let old_len = old_lines.len();
+            // Trailing blank lines below the cursor are just empty screen
+            // padding; don't let them push real content into scrollback when
+            // rewrapping.
+            let mut active_end = old_len;
+            while active_end > cursor_row + 1
+                && !old_lines[active_end - 1].wrapped
+                && is_line_empty(&old_lines[active_end - 1])
+            {
+                active_end -= 1;
+            }
+            let trailing_blanks = old_len - active_end;
+
+            let mut new_lines: VecDeque<Line> = VecDeque::with_capacity(old_len);
+            let mut logical: Vec<Cell> = Vec::with_capacity(new_cols * 2);
+            let mut new_cursor_row = 0usize;
+            let mut new_cursor_col = 0usize;
+            let mut cursor_placed = false;
+
+            let mut index = 0;
+            while index < active_end {
+                logical.clear();
+                let group_start = index;
+                let first_id = old_lines[index].id;
+                let first_rev = old_lines[index].revision.wrapping_add(1);
+                let mut cursor_offset: Option<usize> = None;
+
+                let mut pos = index;
+                let mut group_has_cursor = false;
+                loop {
+                    if pos == cursor_row {
+                        group_has_cursor = true;
+                    }
+                    let line = &old_lines[pos];
+                    let row_base = logical.len();
+                    if line.wrapped {
+                        let next_wide = old_lines
+                            .get(pos + 1)
+                            .and_then(|next| next.cells.first())
+                            .is_some_and(|cell| cell.width == 2);
+                        let keep =
+                            wrapped_line_content_len(&line.cells, line.cells.len(), next_wide);
+                        if pos == cursor_row {
+                            cursor_offset = Some(row_base + cursor_col.min(keep));
+                        }
+                        logical.extend_from_slice(&line.cells[..keep]);
+                    } else if line.tail.is_some() {
+                        let target = cursor_col + usize::from(self.wrap_pending);
+                        line.extend_logical(&mut logical);
+                        if pos == cursor_row {
+                            cursor_offset = Some(row_base + target.min(logical.len() - row_base));
+                        }
+                        moved = true;
+                        pos += 1;
+                        break;
+                    } else {
+                        let content_len = trimmed_cell_len(&line.cells);
+                        let keep = if pos == cursor_row {
+                            let target = cursor_col + usize::from(self.wrap_pending);
+                            content_len.max(target.min(line.cells.len()))
+                        } else {
+                            content_len
+                        };
+                        if pos == cursor_row {
+                            let target = cursor_col + usize::from(self.wrap_pending);
+                            cursor_offset = Some(row_base + target.min(keep));
+                        }
+                        logical.extend_from_slice(&line.cells[..keep]);
+                        pos += 1;
+                        break;
+                    }
+                    pos += 1;
+                    if pos >= active_end {
+                        break;
+                    }
+                }
+                index = pos;
+
+                let out_start = new_lines.len();
+                // While bracketed paste is active on the primary screen, an
+                // interactive line editor (zsh ZLE, bash readline, fish) owns
+                // the cursor's logical line and will immediately redraw it on
+                // SIGWINCH using cursor-up counts computed from the old width.
+                // Keep the cursor's logical line at its current row count so
+                // the shell's redraw lands on the exact prompt start while
+                // every line above it still reflows dynamically.
+                if track_cursor && self.bracketed_paste && group_has_cursor {
+                    for (orig, old_line) in
+                        old_lines.iter().enumerate().take(index).skip(group_start)
+                    {
+                        let mut line = old_line.clone();
+                        resize_line(&mut line, new_cols);
+                        if orig == cursor_row {
+                            new_cursor_row = new_lines.len();
+                            new_cursor_col = cursor_col.min(new_cols - 1);
+                            new_wrap_pending = self.wrap_pending && cursor_col >= new_cols;
+                            cursor_placed = true;
+                        }
+                        new_lines.push_back(line);
+                    }
+                    if old_cols != new_cols {
+                        moved = true;
+                    }
+                    continue;
+                }
+                let group_soft = index - group_start > 1 || old_lines[group_start].soft;
+                if !group_soft && !old_lines[group_start].wrapped && logical.len() > new_cols {
+                    let line = build_clipped_line(first_id, &logical, new_cols, first_rev);
+                    if let Some(off) = cursor_offset {
+                        new_cursor_row = out_start;
+                        new_cursor_col = off.min(new_cols - 1);
+                        cursor_placed = true;
+                    }
+                    new_lines.push_back(line);
+                    moved = true;
+                    continue;
+                }
+                if logical.is_empty() {
+                    let mut line = Line::new(first_id, vec![Cell::blank(); new_cols]);
+                    line.revision = first_rev;
+                    if cursor_offset.is_some() {
+                        new_cursor_row = out_start;
+                        new_cursor_col = 0;
+                        cursor_placed = true;
+                    }
+                    new_lines.push_back(line);
+                } else {
+                    let mut row_start = 0usize;
+                    let mut first = true;
+                    while row_start < logical.len() {
+                        let row_end = next_wrap_cut(&logical, row_start, new_cols);
+                        let wrapped = row_end < logical.len();
+                        let id = if first {
+                            first = false;
+                            first_id
+                        } else {
+                            self.next_line_id()
+                        };
+                        let row_idx = new_lines.len();
+                        if let Some(off) = cursor_offset
+                            && !cursor_placed
+                        {
+                            if off < row_end {
+                                new_cursor_row = row_idx;
+                                new_cursor_col = (off - row_start).min(new_cols - 1);
+                                cursor_placed = true;
+                            } else if off == row_end && !wrapped {
+                                if off - row_start < new_cols {
+                                    new_cursor_row = row_idx;
+                                    new_cursor_col = off - row_start;
+                                    cursor_placed = true;
+                                } else {
+                                    // Cursor sat right after the last cell of
+                                    // a full row; keep it on the last column
+                                    // with wrap_pending preserved.
+                                    new_cursor_row = row_idx;
+                                    new_cursor_col = new_cols - 1;
+                                    new_wrap_pending = true;
+                                    cursor_placed = true;
+                                }
+                            }
+                        }
+                        new_lines.push_back(build_line_from_slice(
+                            id,
+                            &logical[row_start..row_end],
+                            new_cols,
+                            wrapped,
+                            first_rev,
+                        ));
+                        row_start = row_end;
+                    }
+                    if cursor_offset.is_some() && !cursor_placed {
+                        new_cursor_row = new_lines.len().saturating_sub(1);
+                        new_cursor_col = new_cols - 1;
+                        cursor_placed = true;
+                    }
+                }
+                if group_soft {
+                    for line in new_lines.iter_mut().skip(out_start) {
+                        line.soft = true;
+                    }
+                }
+                if new_lines.len() - out_start != index - group_start {
+                    moved = true;
+                }
+            }
+
+            for _ in 0..trailing_blanks {
+                if new_lines.len() >= new_rows {
+                    break;
+                }
+                let line = self.new_line();
+                new_lines.push_back(line);
+            }
+
+            self.main = new_lines;
+            if cursor_placed {
+                cursor_row = new_cursor_row;
+                cursor_col = new_cursor_col;
+            }
+            if pulled_prefix > 0 {
+                moved = true;
+            }
+        }
+
+        // While bracketed paste is active on the primary screen, an interactive
+        // line editor owns the cursor's wrapped prompt. If a vertical shrink
+        // makes the viewport shorter than the wrapped prompt, discard the
+        // prompt's clipped top rows instead of archiving them into scrollback
+        // where the shell's cursor-up redraw cannot reach them (which would
+        // duplicate the prompt on every vertical resize).
+        if track_cursor && self.bracketed_paste && self.main.len() > new_rows {
+            let mut prompt_start = cursor_row.min(self.main.len().saturating_sub(1));
+            while prompt_start > 0 && self.main[prompt_start - 1].wrapped {
+                prompt_start -= 1;
+            }
+            let prompt_len = cursor_row.saturating_sub(prompt_start) + 1;
+            if prompt_len > new_rows {
+                let drop_count = prompt_len - new_rows;
+                for _ in 0..drop_count {
+                    self.main.remove(prompt_start);
+                }
+                cursor_row = cursor_row.saturating_sub(drop_count);
+                moved = true;
+            }
+        }
+
+        // Fit `self.main` to `new_rows`:
+        // - If too tall, first drop trailing blank lines below the cursor,
+        //   then push overflow rows from the top into scrollback.
+        // - If too short, pull lines back from scrollback (keeping content
+        //   pinned to the bottom if there is history) and pad with blanks.
+        while self.main.len() > new_rows {
+            if self.main.len() > cursor_row + 1
+                && self
+                    .main
+                    .back()
+                    .is_some_and(|line| !line.wrapped && is_line_empty(line))
+            {
+                self.main.pop_back();
+            } else if let Some(top) = self.main.pop_front() {
+                if self.history != 0 {
+                    self.scrollback.push_line(&top, new_cols, self.history);
+                }
+                cursor_row = cursor_row.saturating_sub(1);
+                moved = true;
+            } else {
+                break;
+            }
+        }
+
+        if self.main.len() < new_rows {
+            // Pull back from scrollback when rows grew or unwrapping freed
+            // rows. Only the logical lines actually pulled onto the screen are
+            // reflowed here, keeping interactive drags O(rows) instead of
+            // O(history); the rest of scrollback reflows once the drag settles.
+            while self.main.len() < new_rows && self.scrollback.len() > 0 {
+                let mut next_id = self.line_id_next;
+                let next_wide = self
+                    .main
+                    .front()
+                    .and_then(|line| line.cells.first())
+                    .is_some_and(|cell| cell.width == 2);
+                let mut pulled =
+                    self.scrollback
+                        .pop_back_logical_reflowed(new_cols, &mut next_id, next_wide);
+                self.line_id_next = next_id;
+                let need = new_rows - self.main.len();
+                let split = pulled.len().saturating_sub(need);
+                // Any leading rows of this logical line that still don't fit
+                // go back onto the tail of scrollback already at `new_cols`.
+                for overflow in pulled.drain(..split) {
+                    if self.history != 0 {
+                        self.scrollback.push_line(&overflow, new_cols, self.history);
+                    }
+                }
+                for line in pulled.into_iter().rev() {
+                    self.main.push_front(line);
+                    cursor_row += 1;
+                    moved = true;
+                }
+            }
+            while self.main.len() < new_rows {
+                let line = self.new_line();
+                self.main.push_back(line);
+            }
+        }
+
+        if track_cursor {
+            self.cursor.x = cursor_col.min(new_cols - 1);
+            self.cursor.y = cursor_row.min(new_rows - 1);
+            self.wrap_pending = new_wrap_pending;
+            if (self.cursor.x, self.cursor.y) != old_cursor {
+                moved = true;
+            }
+        }
+        if moved {
+            self.renumber_lines();
+        }
+        self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+        if self.scroll_offset > 0 {
+            moved = true;
+        }
+        moved
     }
 
     /// Reflows scrollback lines after a width change. Called once the resize
     /// settles so interactive drags do not pay this cost on every event.
-    pub fn finish_deferred_resize(&mut self) {
+    pub fn finish_deferred_resize(&mut self) -> bool {
         if !self.pending_scrollback_resize {
-            return;
+            return false;
         }
         self.pending_scrollback_resize = false;
-        self.scrollback.resize_all(self.cols);
+        if self.scrollback.len() == 0 {
+            return false;
+        }
+        let view_top_id = if self.scroll_offset > 0 {
+            self.visible_line(0).map(|line| line.id)
+        } else {
+            None
+        };
+        let mut next_id = self.line_id_next;
+        let screen_first_wide = self
+            .main
+            .front()
+            .and_then(|line| line.cells.first())
+            .is_some_and(|cell| cell.width == 2);
+        let new_top = self.scrollback.reflow(
+            self.cols,
+            self.history,
+            &mut next_id,
+            view_top_id,
+            screen_first_wide,
+        );
+        self.line_id_next = next_id;
+        self.renumber_lines();
+        if let Some(top_idx) = new_top {
+            self.scroll_offset = self.scrollback.len().saturating_sub(top_idx);
+        } else {
+            self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+        }
+        if self.search.is_some() {
+            let query = self.search.as_ref().unwrap().query.clone();
+            self.refresh_search(&query);
+        }
+        if self.scroll_offset > 0 {
+            self.mark_all();
+            return true;
+        }
+        false
     }
 
     pub fn set_window_pixels(&mut self, width: u16, height: u16) {
@@ -1829,6 +2561,10 @@ impl Terminal {
         let width = width.min(2);
         if self.wrap_pending {
             if self.autowrap {
+                let wrap_y = self.cursor.y;
+                let wrap_line = self.line_mut(wrap_y);
+                wrap_line.wrapped = true;
+                wrap_line.tail = None;
                 self.index();
                 self.cursor.x = 0;
             }
@@ -1836,6 +2572,19 @@ impl Terminal {
         }
         if width == 2 && self.cursor.x + 1 >= self.cols {
             if self.autowrap {
+                let wrap_y = self.cursor.y;
+                let wrap_x = self.cursor.x;
+                let cols = self.cols;
+                if wrap_x < cols {
+                    let line = self.line_mut(wrap_y);
+                    if line.cells[wrap_x].width != 1 {
+                        line.clear_wide_at(wrap_x);
+                    }
+                    line.cells[wrap_x] = Cell::blank();
+                    line.mark_written(wrap_x);
+                    line.wrapped = true;
+                    line.tail = None;
+                }
                 self.index();
                 self.cursor.x = 0;
             } else {
@@ -1946,9 +2695,13 @@ impl Terminal {
                     let line = &mut lines[physical];
                     line.write_ascii_slice(x, &bytes[offset..offset + take], fg, bg, attrs, meta);
                     line.mark_written_range(x, x + take - 1);
-                    line.wrapped = false;
                     x += take;
                     offset += take;
+                    let will_wrap = x == cols && offset < bytes.len();
+                    line.wrapped = will_wrap;
+                    if will_wrap {
+                        line.tail = None;
+                    }
                     if x == cols {
                         x = 0;
                         physical += 1;
@@ -1976,6 +2729,10 @@ impl Terminal {
         while offset < bytes.len() {
             if self.wrap_pending {
                 if self.autowrap {
+                    let wrap_y = self.cursor.y;
+                    let wrap_line = self.line_mut(wrap_y);
+                    wrap_line.wrapped = true;
+                    wrap_line.tail = None;
                     self.index();
                     self.cursor.x = 0;
                 }
@@ -2433,6 +3190,7 @@ impl Terminal {
         let cols = self.cols;
         let bg = self.pen.bg;
         let line = self.line_mut(y);
+        line.tail = None;
         line.cells.copy_within(x..cols - count, x + count);
         let blank = Cell {
             bg,
@@ -2450,6 +3208,7 @@ impl Terminal {
         let cols = self.cols;
         let bg = self.pen.bg;
         let line = self.line_mut(y);
+        line.tail = None;
         line.cells.copy_within(x + count..cols, x);
         let blank = Cell {
             bg,
@@ -2458,6 +3217,12 @@ impl Terminal {
         line.cells[cols - count..cols].fill(blank);
         line.mark_all_written();
         self.mark_row(y);
+    }
+
+    fn clear_prev_wrap(&mut self, y: usize) {
+        if y > 0 {
+            self.line_mut(y - 1).wrapped = false;
+        }
     }
 
     fn erase_cells(&mut self, y: usize, from: usize, to: usize) {
@@ -2475,6 +3240,11 @@ impl Terminal {
             ..Cell::blank()
         };
         let line = self.line_mut(y);
+        if to + 1 >= cols {
+            line.wrapped = false;
+            line.tail = None;
+            line.soft = false;
+        }
         if bg == Color::Default {
             if line.written_min > line.written_max {
                 return;
@@ -2526,6 +3296,7 @@ impl Terminal {
         }
         self.normalize_region();
         let y = self.cursor.y;
+        self.clear_prev_wrap(y);
         let bottom = self.scroll_bottom;
         let cols = self.cols;
         let count = count.min(bottom - y + 1);
@@ -2550,6 +3321,7 @@ impl Terminal {
         }
         self.normalize_region();
         let y = self.cursor.y;
+        self.clear_prev_wrap(y);
         let bottom = self.scroll_bottom;
         let cols = self.cols;
         let count = count.min(bottom - y + 1);
@@ -2692,6 +3464,7 @@ impl Terminal {
         self.newline_mode = false;
         self.reverse_video = false;
         self.bracketed_paste = false;
+        self.sync_output = false;
         self.focus_events = false;
         self.theme = self.default_theme.clone();
         self.reset_tabs();
@@ -2746,11 +3519,129 @@ fn blank_in_place(line: &mut Line, id: u64) {
 
 /// Pads or truncates a stored line to a new width.
 fn resize_line(line: &mut Line, cols: usize) {
+    line.tail = None;
     line.cells.resize(cols, Cell::blank());
     if line.cells.is_empty() {
         line.cells.push(Cell::blank());
     }
+    if line.cells.last().is_some_and(|cell| cell.width == 2) {
+        *line.cells.last_mut().unwrap() = Cell::blank();
+    }
     line.mark_all_written();
+}
+
+/// True when a cell carries visible content or non-default styling.
+#[inline]
+fn cell_has_content(cell: &Cell) -> bool {
+    !(cell.ch == ' '
+        && cell.meta == 0
+        && cell.bg == Color::Default
+        && cell.attrs == Attrs::default()
+        && cell.width == 1)
+}
+
+fn is_line_empty(line: &Line) -> bool {
+    if line.written_min > line.written_max {
+        return true;
+    }
+    let end = (line.written_max + 1).min(line.cells.len());
+    !line.cells[line.written_min..end]
+        .iter()
+        .any(cell_has_content)
+}
+
+/// Length of `cells` excluding trailing default blanks.
+fn trimmed_cell_len(cells: &[Cell]) -> usize {
+    let mut end = cells.len();
+    while end > 0 && !cell_has_content(&cells[end - 1]) {
+        end -= 1;
+    }
+    end
+}
+
+/// Length of content on a wrapped line. Preserves interior spaces up to the
+/// right margin, stripping only a single trailing pad blank inserted when a
+/// wide character could not fit in the final column and wrapped onto the next
+/// line.
+fn wrapped_line_content_len(cells: &[Cell], cols: usize, next_starts_wide: bool) -> usize {
+    if next_starts_wide
+        && cells.len() == cols
+        && cols >= 2
+        && !cell_has_content(&cells[cols - 1])
+        && cells[cols - 2].width != 2
+    {
+        return cols - 1;
+    }
+    cells.len()
+}
+
+/// Computes the exclusive end index within `logical` for one visual row of
+/// width `cols` starting at `start`, never splitting a wide character.
+fn next_wrap_cut(logical: &[Cell], start: usize, cols: usize) -> usize {
+    let remaining = logical.len() - start;
+    if remaining <= cols {
+        return logical.len();
+    }
+    let mut end = start + cols;
+    // If the cell at `end` is a continuation (width 0), the wide character
+    // starts at `end - 1` and cannot fit in the single remaining column.
+    if logical[end].width == 0 && end > start + 1 {
+        end -= 1;
+    } else if logical[end].width == 0 {
+        // Pathological case: cols == 1 with a wide char. Advance past both
+        // cells so we make progress instead of looping forever.
+        end = (end + 1).min(logical.len());
+    }
+    end
+}
+
+fn build_line_from_slice(
+    id: u64,
+    slice: &[Cell],
+    cols: usize,
+    wrapped: bool,
+    revision: u64,
+) -> Line {
+    let mut cells = vec![Cell::blank(); cols];
+    let copy_len = slice.len().min(cols);
+    let mut has_wide = false;
+    if copy_len > 0 {
+        cells[..copy_len].copy_from_slice(&slice[..copy_len]);
+        if copy_len == cols && cells[cols - 1].width == 2 {
+            cells[cols - 1] = Cell::blank();
+        }
+        has_wide = cells[..copy_len].iter().any(|cell| cell.width != 1);
+    }
+    let mut line = Line {
+        id,
+        cells,
+        wrapped,
+        tail: None,
+        soft: false,
+        has_wide,
+        written_min: if copy_len > 0 { 0 } else { usize::MAX },
+        written_max: copy_len.saturating_sub(1),
+        revision,
+    };
+    if copy_len == 0 {
+        line.written_min = usize::MAX;
+        line.written_max = 0;
+    }
+    line
+}
+
+/// Builds a single unwrapped row showing as much of `content` as fits in
+/// `cols`, keeping the rest as a tail for a later widening.
+fn build_clipped_line(id: u64, content: &[Cell], cols: usize, revision: u64) -> Line {
+    let cut = next_wrap_cut(content, 0, cols);
+    let mut line = build_line_from_slice(id, &content[..cut], cols, false, revision);
+    if cut < content.len() {
+        line.tail = Some(Box::new(LineTail {
+            start: cut,
+            cells: content[cut..].to_vec(),
+        }));
+    }
+    line
 }
 
 fn ordered(a: Anchor, b: Anchor) -> (Anchor, Anchor) {
@@ -3473,6 +4364,545 @@ mod tests {
             .mouse_report(0, 5, 2, false, false, MouseMods::default())
             .unwrap();
         assert_eq!(release, b"\x1b[<0;6;3m");
+    }
+
+    #[test]
+    fn zsh_redraws_after_tiny_window_keep_content_above_prompt() {
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let mut terminal = Terminal::new(105, 30, 1000, theme, CursorStyle::Block, false);
+        let mut parser = Parser::new();
+        for i in 0..22 {
+            let line = format!("fetch line {i:02} 0123456789abcdef\r\n");
+            parser.advance(line.as_bytes(), &mut terminal);
+        }
+        let mut boxes = String::new();
+        for base in [0u8, 8u8] {
+            boxes.push_str("\x1b[42C");
+            for block in 0..8u8 {
+                boxes.push_str(&format!("\x1b[48;5;{}m   ", base + block));
+            }
+            boxes.push_str("\x1b[0m\r\n");
+        }
+        parser.advance(boxes.as_bytes(), &mut terminal);
+        let prompt = b"\x1b[0m\x1b[27m\x1b[24m\x1b[J\x1b[38;5;178m/tmp/samuel/Volatile/reliabilitty/target/release \x1b[39m";
+        parser.advance(b"\x1b[?2004h", &mut terminal);
+        parser.advance(prompt, &mut terminal);
+
+        // Sizes and cursor-up counts a real zsh emitted on SIGWINCH while the
+        // window was dragged down to 5x2 and back.
+        let steps = [
+            (82usize, 23usize, 0usize),
+            (49, 15, 0),
+            (19, 6, 0),
+            (5, 2, 2),
+            (19, 6, 8),
+            (49, 15, 2),
+            (82, 23, 0),
+            (105, 30, 0),
+        ];
+        for (cols, rows, up) in steps {
+            terminal.resize(cols, rows, 6, 13);
+            let mut seq = b"\r\r".to_vec();
+            for _ in 0..up {
+                seq.extend_from_slice(b"\x1b[A");
+            }
+            seq.extend_from_slice(prompt);
+            parser.advance(&seq, &mut terminal);
+        }
+        for i in 0..22 {
+            assert_eq!(
+                row_text(&terminal, i),
+                format!("fetch line {i:02} 0123456789abcdef")
+            );
+        }
+        for row in 22..24 {
+            let line = terminal.visible_line(row).unwrap();
+            let colored = line.cells.iter().filter(|c| c.bg != Color::Default).count();
+            assert_eq!(colored, 24, "box row {row} lost cells");
+        }
+        assert_eq!(
+            row_text(&terminal, 24),
+            "/tmp/samuel/Volatile/reliabilitty/target/release"
+        );
+        assert_eq!(row_text(&terminal, 25), "");
+    }
+
+    fn row_text(terminal: &Terminal, row: usize) -> String {
+        let line = terminal.visible_line(row).unwrap();
+        let mut s = String::new();
+        for col in 0..line.cols {
+            let cell = line.cell(col).unwrap();
+            if cell.width == 0 {
+                continue;
+            }
+            s.push(cell.ch);
+        }
+        s.trim_end().to_string()
+    }
+
+    #[test]
+    fn resize_reflows_shrink_and_regrow_without_losing_text() {
+        let mut terminal = terminal(8);
+        feed(&mut terminal, b"hello world 123456 second line\r\nnext");
+        assert_eq!(row_text(&terminal, 0), "hello world 123456 s");
+        assert!(terminal.visible_line(0).unwrap().wrapped);
+        assert_eq!(row_text(&terminal, 1), "econd line");
+        assert_eq!(row_text(&terminal, 2), "next");
+
+        assert!(terminal.resize(6, 8, 9, 18));
+        assert_eq!(row_text(&terminal, 0), "hello");
+        assert!(terminal.visible_line(0).unwrap().wrapped);
+        assert_eq!(row_text(&terminal, 1), "world");
+        assert!(terminal.visible_line(1).unwrap().wrapped);
+        assert_eq!(row_text(&terminal, 2), "123456");
+        assert!(terminal.visible_line(2).unwrap().wrapped);
+        assert_eq!(row_text(&terminal, 3), " secon");
+        assert!(terminal.visible_line(3).unwrap().wrapped);
+        assert_eq!(row_text(&terminal, 4), "d line");
+        assert!(!terminal.visible_line(4).unwrap().wrapped);
+        assert_eq!(row_text(&terminal, 5), "next");
+
+        assert!(terminal.resize(20, 8, 9, 18));
+        assert_eq!(row_text(&terminal, 0), "hello world 123456 s");
+        assert!(terminal.visible_line(0).unwrap().wrapped);
+        assert_eq!(row_text(&terminal, 1), "econd line");
+        assert!(!terminal.visible_line(1).unwrap().wrapped);
+        assert_eq!(row_text(&terminal, 2), "next");
+    }
+
+    #[test]
+    fn resize_preserves_spaces_at_wrap_boundary() {
+        let mut terminal = terminal(8);
+        feed(&mut terminal, b"0123456789ABCDEFGHIJabcd efgh");
+        terminal.resize(5, 8, 9, 18);
+        assert_eq!(terminal.lines()[4].cells[4].ch, ' ');
+        assert!(terminal.lines()[4].wrapped);
+        assert_eq!(row_text(&terminal, 5), "efgh");
+        terminal.resize(20, 8, 9, 18);
+        assert_eq!(row_text(&terminal, 1), "abcd efgh");
+    }
+
+    #[test]
+    fn resize_reflow_overflows_to_scrollback_and_pulls_back_on_expand() {
+        let mut terminal = terminal(3);
+        feed(&mut terminal, b"0123456789abcdefghijklmno");
+        terminal.resize(5, 3, 9, 18);
+        assert_eq!(terminal.scrollback_len(), 2);
+        assert_eq!(row_text(&terminal, 0), "abcde");
+        assert_eq!(row_text(&terminal, 1), "fghij");
+        assert_eq!(row_text(&terminal, 2), "klmno");
+
+        terminal.resize(20, 3, 9, 18);
+        assert_eq!(terminal.scrollback_len(), 0);
+        assert_eq!(row_text(&terminal, 0), "0123456789abcdefghij");
+        assert_eq!(row_text(&terminal, 1), "klmno");
+    }
+
+    #[test]
+    fn resize_reflow_tracks_cursor_through_wrap_and_unwrap() {
+        let mut terminal = terminal(8);
+        feed(&mut terminal, b"0123456789abcdefghijklmno");
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), (5, 1));
+
+        terminal.resize(4, 8, 9, 18);
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), (1, 6));
+
+        terminal.resize(20, 8, 9, 18);
+        assert_eq!((terminal.cursor.x, terminal.cursor.y), (5, 1));
+    }
+
+    #[test]
+    fn resize_reflow_handles_wide_characters_without_splitting() {
+        let mut terminal = terminal(8);
+        feed(
+            &mut terminal,
+            "0123456789ABCDEFGHIJa\u{4e16}\u{754c}b".as_bytes(),
+        );
+        terminal.resize(4, 8, 9, 18);
+        assert_eq!(terminal.lines()[5].cells[0].ch, 'a');
+        assert_eq!(terminal.lines()[5].cells[1].ch, '\u{4e16}');
+        assert_eq!(terminal.lines()[5].cells[1].width, 2);
+        assert_eq!(terminal.lines()[5].cells[2].width, 0);
+        assert_eq!(terminal.lines()[5].cells[3].ch, ' ');
+        assert!(terminal.lines()[5].wrapped);
+        assert_eq!(terminal.lines()[6].cells[0].ch, '\u{754c}');
+        assert_eq!(terminal.lines()[6].cells[0].width, 2);
+        assert_eq!(terminal.lines()[6].cells[1].width, 0);
+        assert_eq!(terminal.lines()[6].cells[2].ch, 'b');
+
+        terminal.resize(20, 8, 9, 18);
+        assert_eq!(row_text(&terminal, 1), "a\u{4e16}\u{754c}b");
+    }
+
+    #[test]
+    fn resize_deferred_scrollback_reflow_rewraps_history() {
+        let mut terminal = terminal(2);
+        feed(
+            &mut terminal,
+            b"0123456789abcdefghij0123456789\r\nsecond\r\nthird",
+        );
+        assert_eq!(terminal.scrollback_len(), 2);
+        assert_eq!(terminal.scrollback_cells_len(0), 20);
+
+        // Live rows are clipped at once; scrollback stays at width 20 until
+        // the drag settles.
+        terminal.resize(5, 2, 9, 18);
+        assert_eq!(terminal.scrollback_cells_len(0), 20);
+        assert_eq!(row_text(&terminal, 0), "secon");
+        assert_eq!(row_text(&terminal, 1), "third");
+
+        terminal.finish_deferred_resize();
+        assert_eq!(terminal.scrollback_len(), 6);
+        assert_eq!(terminal.scrollback_cells_len(0), 5);
+        assert!(terminal.scrollback.entries[0].wrapped);
+        assert_eq!(
+            terminal
+                .scrollback
+                .cells_of(&terminal.scrollback.entries[0])
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>(),
+            "01234"
+        );
+        assert_eq!(
+            terminal
+                .scrollback
+                .cells_of(&terminal.scrollback.entries[1])
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>(),
+            "56789"
+        );
+
+        terminal.resize(20, 2, 9, 18);
+        terminal.finish_deferred_resize();
+        assert_eq!(row_text(&terminal, 0), "second");
+        assert_eq!(row_text(&terminal, 1), "third");
+        assert_eq!(terminal.scrollback_len(), 2);
+        assert!(terminal.scrollback.entries[0].wrapped);
+        assert!(!terminal.scrollback.entries[1].wrapped);
+        assert_eq!(
+            terminal
+                .scrollback
+                .cells_of(&terminal.scrollback.entries[1])
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>(),
+            "0123456789"
+        );
+    }
+
+    #[test]
+    fn resize_reflow_survives_repeated_shrink_grow_cycles_and_zero_history() {
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let mut terminal = Terminal::new(20, 4, 0, theme, CursorStyle::Block, false);
+        feed(&mut terminal, b"short\r\n0123456789abcdefghij");
+        for cols in [15, 10, 7, 10, 15, 20, 8, 20] {
+            terminal.resize(cols, 4, 9, 18);
+            terminal.finish_deferred_resize();
+        }
+        assert_eq!(row_text(&terminal, 0), "short");
+        assert_eq!(row_text(&terminal, 1), "0123456789abcdefghij");
+    }
+
+    #[test]
+    fn resize_reflow_preserves_colors_and_links_across_wraps() {
+        let mut terminal = terminal(10);
+        feed(
+            &mut terminal,
+            b"ABCDEFGHIJKLMNOPQRST\x1b[38;2;10;20;30m\x1b]8;;https://example.com\x1b\\abcdefghij\x1b]8;;\x1b\\",
+        );
+        terminal.resize(4, 10, 9, 18);
+        assert_eq!(row_text(&terminal, 5), "abcd");
+        assert_eq!(row_text(&terminal, 6), "efgh");
+        assert_eq!(row_text(&terminal, 7), "ij");
+        assert_eq!(
+            terminal.visible_line(6).unwrap().cells[0].fg,
+            Color::Rgb([10, 20, 30])
+        );
+        assert_eq!(terminal.link_at(7, 1), Some("https://example.com"));
+
+        terminal.resize(20, 10, 9, 18);
+        assert_eq!(row_text(&terminal, 1), "abcdefghij");
+        assert_eq!(
+            terminal.visible_line(1).unwrap().cells[9].fg,
+            Color::Rgb([10, 20, 30])
+        );
+        assert_eq!(terminal.link_at(1, 9), Some("https://example.com"));
+    }
+
+    #[test]
+    fn resize_reflow_preserves_colored_blocks_and_zsh_prompt() {
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let mut terminal = Terminal::new(100, 30, 1000, theme, CursorStyle::Block, false);
+        let mut parser = Parser::new();
+        let init = b"                                          \x1b[40m   \x1b[41m   \x1b[42m   \x1b[43m   \x1b[44m   \x1b[45m   \x1b[46m   \x1b[47m   \x1b[m\r\n                                          \x1b[100m   \x1b[101m   \x1b[102m   \x1b[103m   \x1b[104m   \x1b[105m   \x1b[106m   \x1b[107m   \x1b[m\r\n\x1b[0m\x1b[27m\x1b[24m\x1b[J\x1b[38;5;178m/tmp/samuel/Volatile/reliabilitty/target/release \x1b[39m\x1b[K\x1b[?2004h";
+        parser.advance(init, &mut terminal);
+        let prompt = b"\x1b[0m\x1b[27m\x1b[24m\x1b[J\x1b[38;5;178m/tmp/samuel/Volatile/reliabilitty/target/release \x1b[39m";
+        // Shrink stepwise all the way to 20 (wrapping both colored-box rows and
+        // the prompt itself) and grow back to 100: both colored-box rows must
+        // survive intact with zero repeated slashes or overwritten blocks.
+        let mut prev_cols = 100usize;
+        for cols in (20..=100).rev().chain(21..=100) {
+            let prev_rows_used = 49usize / prev_cols;
+            terminal.resize(cols, 30, 6, 13);
+            let mut seq = vec![b'\r'];
+            for _ in 0..prev_rows_used {
+                seq.extend_from_slice(b"\x1b[A");
+            }
+            seq.extend_from_slice(prompt);
+            if cols == 49 {
+                seq.extend_from_slice(b"\r\n\x1b[K");
+            }
+            parser.advance(&seq, &mut terminal);
+            prev_cols = cols;
+        }
+        assert_eq!(row_text(&terminal, 0), "");
+        assert_eq!(row_text(&terminal, 1), "");
+        assert_eq!(
+            row_text(&terminal, 2),
+            "/tmp/samuel/Volatile/reliabilitty/target/release"
+        );
+        for (row, base) in [(0usize, 0u8), (1usize, 8u8)] {
+            for block in 0..8usize {
+                let col = 42 + block * 3;
+                assert_eq!(
+                    terminal.visible_line(row).unwrap().cells[col].bg,
+                    Color::Indexed(base + block as u8),
+                    "row {row} block {block} color lost"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_vertical_resize_does_not_repeat_prompt() {
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let mut terminal = Terminal::new(100, 30, 1000, theme, CursorStyle::Block, false);
+        let mut parser = Parser::new();
+        for i in 0..22 {
+            let line = format!("fastfetch line {i:02} 0123456789abcdef\r\n");
+            parser.advance(line.as_bytes(), &mut terminal);
+        }
+        let prompt = b"\x1b[0m\x1b[27m\x1b[24m\x1b[J\x1b[38;5;178m/tmp/samuel/Volatile/reliabilitty/target/release \x1b[39m";
+        parser.advance(b"\x1b[?2004h", &mut terminal);
+        parser.advance(prompt, &mut terminal);
+
+        let steps = [
+            // Shrink narrow to 47 cols, then shrink vertically below prompt
+            // height multiple times, then restore to 100x30.
+            (47usize, 30usize, 0usize),
+            (47, 1, 1),
+            (47, 8, 1),
+            (47, 1, 1),
+            (47, 30, 1),
+            (100, 30, 1),
+        ];
+        for (cols, rows, up) in steps {
+            terminal.resize(cols, rows, 6, 13);
+            let mut seq = vec![b'\r'];
+            for _ in 0..up {
+                seq.extend_from_slice(b"\x1b[A");
+            }
+            seq.extend_from_slice(prompt);
+            parser.advance(&seq, &mut terminal);
+        }
+        let mut prompt_rows = 0;
+        for r in 0..30 {
+            let t = row_text(&terminal, r);
+            if t.contains("/tmp/samuel") {
+                prompt_rows += 1;
+            }
+        }
+        assert_eq!(prompt_rows, 1, "prompt repeated {prompt_rows} times");
+        let mut expected = 0usize;
+        for r in 0..30 {
+            let t = row_text(&terminal, r);
+            if t.starts_with("fastfetch") {
+                assert_eq!(t, format!("fastfetch line {expected:02} 0123456789abcdef"));
+                expected += 1;
+            }
+        }
+        assert!(expected >= 20, "fastfetch lines lost: {expected} kept");
+        assert!(!(0..30).any(|r| row_text(&terminal, r).contains("////")));
+        let prompt_row = (0..30)
+            .find(|&r| row_text(&terminal, r).contains("/tmp/samuel"))
+            .unwrap();
+        assert_eq!(prompt_row, expected);
+    }
+
+    #[test]
+    fn unwrapped_row_is_clipped_not_split_and_restored_on_widen() {
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let mut terminal = Terminal::new(100, 6, 100, theme, CursorStyle::Block, false);
+        let mut parser = Parser::new();
+        let mut input = String::from("art\x1b[42C");
+        for color in 0..8 {
+            input.push_str(&format!("\x1b[48;5;{color}m   "));
+        }
+        input.push_str("\x1b[0m\r\nsecond\r\nthird");
+        parser.advance(input.as_bytes(), &mut terminal);
+        let original: Vec<String> = (0..6).map(|row| row_text(&terminal, row)).collect();
+
+        terminal.resize(20, 6, 6, 13);
+        assert_eq!(row_text(&terminal, 0), "art");
+        assert_eq!(row_text(&terminal, 1), "second");
+        assert_eq!(row_text(&terminal, 2), "third");
+
+        terminal.resize(30, 6, 6, 13);
+        terminal.resize(100, 6, 6, 13);
+        let restored: Vec<String> = (0..6).map(|row| row_text(&terminal, row)).collect();
+        assert_eq!(restored, original);
+        for block in 0..8usize {
+            let col = 3 + 42 + block * 3;
+            assert_eq!(
+                terminal.visible_line(0).unwrap().cells[col].bg,
+                Color::Indexed(block as u8),
+                "block {block} lost"
+            );
+        }
+    }
+
+    #[test]
+    fn clipped_row_survives_scrollback_round_trip() {
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let mut terminal = Terminal::new(100, 6, 100, theme, CursorStyle::Block, false);
+        let mut parser = Parser::new();
+        parser.advance(
+            b"head\x1b[60Ctail-marker\r\nb\r\nc\r\nd\r\ne\r\nf",
+            &mut terminal,
+        );
+        terminal.resize(30, 6, 6, 13);
+        terminal.resize(30, 1, 6, 13);
+        terminal.resize(30, 6, 6, 13);
+        terminal.resize(100, 6, 6, 13);
+        assert_eq!(
+            row_text(&terminal, 0),
+            format!("head{}tail-marker", " ".repeat(60))
+        );
+        assert_eq!(row_text(&terminal, 5), "f");
+    }
+
+    #[test]
+    fn erase_to_end_of_line_drops_clipped_tail() {
+        let theme = Theme::from_config(&crate::config::ColorsConfig::default()).unwrap();
+        let mut terminal = Terminal::new(100, 4, 100, theme, CursorStyle::Block, false);
+        let mut parser = Parser::new();
+        parser.advance(b"head\x1b[60Ctail-marker", &mut terminal);
+        terminal.resize(30, 4, 6, 13);
+        parser.advance(b"\r\x1b[K", &mut terminal);
+        terminal.resize(100, 4, 6, 13);
+        assert_eq!(row_text(&terminal, 0), "");
+    }
+
+    #[test]
+    fn rejoined_soft_wrapped_line_wraps_again_when_narrowed() {
+        let mut terminal = terminal(6);
+        feed(&mut terminal, b"0123456789abcdefghijklmno\r\nnext");
+        assert_eq!(row_text(&terminal, 0), "0123456789abcdefghij");
+        assert_eq!(row_text(&terminal, 1), "klmno");
+
+        terminal.resize(30, 6, 9, 18);
+        assert_eq!(row_text(&terminal, 0), "0123456789abcdefghijklmno");
+        assert_eq!(row_text(&terminal, 1), "next");
+
+        terminal.resize(20, 6, 9, 18);
+        assert_eq!(row_text(&terminal, 0), "0123456789abcdefghij");
+        assert_eq!(row_text(&terminal, 1), "klmno");
+        assert_eq!(row_text(&terminal, 2), "next");
+    }
+
+    #[test]
+    fn rejoined_soft_wrapped_line_survives_scrollback_round_trip() {
+        let mut terminal = terminal(6);
+        feed(&mut terminal, b"0123456789abcdefghijklmno\r\nb\r\nc\r\nd");
+        terminal.resize(30, 6, 9, 18);
+        terminal.resize(30, 1, 9, 18);
+        terminal.resize(30, 6, 9, 18);
+        terminal.resize(20, 6, 9, 18);
+        terminal.finish_deferred_resize();
+        assert_eq!(row_text(&terminal, 0), "0123456789abcdefghij");
+        assert_eq!(row_text(&terminal, 1), "klmno");
+    }
+
+    #[test]
+    fn resize_without_rewrap_reports_unmoved_for_fast_path() {
+        let mut terminal = terminal(4);
+        feed(&mut terminal, b"hi");
+        // Widening when nothing is wrapped and scrollback is empty keeps every
+        // visible glyph in place so App can use the fast resize path.
+        assert!(!terminal.resize(30, 5, 9, 18));
+        // Shrinking while "hi" still fits and rows stay >= active content also
+        // moves nothing.
+        assert!(!terminal.resize(10, 4, 9, 18));
+        // Shrinking below "hi" clips it, so content moved.
+        assert!(terminal.resize(1, 4, 9, 18));
+    }
+
+    #[test]
+    fn resize_keeps_alt_screen_unwrapped_while_reflowing_main() {
+        let mut terminal = terminal(4);
+        feed(&mut terminal, b"0123456789abcdefghijklmno");
+        feed(&mut terminal, b"\x1b[?1049hALT12345678");
+        terminal.resize(5, 4, 9, 18);
+        assert_eq!(row_text(&terminal, 0), "ALT12");
+        assert_eq!(row_text(&terminal, 1), "");
+        feed(&mut terminal, b"\x1b[?1049l");
+        assert_eq!(row_text(&terminal, 0), "56789");
+        assert_eq!(row_text(&terminal, 3), "klmno");
+    }
+
+    #[test]
+    fn synchronized_output_mode_2026_toggles_and_reports() {
+        let mut terminal = terminal(3);
+        assert!(!terminal.synchronized_output());
+        feed(&mut terminal, b"\x1b[?2026h");
+        assert!(terminal.synchronized_output());
+        feed(&mut terminal, b"\x1b[?2026$p");
+        assert_eq!(terminal.take_output(), b"\x1b[?2026;1$y");
+        feed(&mut terminal, b"\x1b[?2026l");
+        assert!(!terminal.synchronized_output());
+        feed(&mut terminal, b"\x1b[?2026$p");
+        assert_eq!(terminal.take_output(), b"\x1b[?2026;2$y");
+    }
+
+    #[test]
+    fn resize_preserves_monotonic_line_ids_for_search_and_selection() {
+        let mut terminal = terminal(3);
+        feed(&mut terminal, b"alpha1234567890\r\nbeta1234567890");
+        terminal.resize(5, 3, 9, 18);
+        terminal.finish_deferred_resize();
+        let all = terminal.all_lines();
+        for pair in all.windows(2) {
+            assert!(
+                pair[0].id < pair[1].id,
+                "non-monotonic ids: {} >= {}",
+                pair[0].id,
+                pair[1].id
+            );
+        }
+        terminal.set_search_query("beta");
+        assert_eq!(terminal.search_summary(), (1, 1));
+    }
+
+    #[test]
+    fn wrapped_flag_set_on_autowrap_and_matches_ascii_run() {
+        let mut a = terminal(3);
+        let mut b = terminal(3);
+        let text = b"0123456789abcdefghijk"; // 21 bytes on 20-col screen -> wraps once
+        for &byte in text {
+            a.print(byte as char);
+        }
+        b.print_ascii_run(text);
+        assert!(a.lines()[0].wrapped);
+        assert!(!a.lines()[1].wrapped);
+        assert!(b.lines()[0].wrapped);
+        assert!(!b.lines()[1].wrapped);
+
+        // Selection across a soft-wrapped line must not inject a newline.
+        a.begin_selection(0, 18, SelectionMode::Char);
+        a.update_selection(1, 0);
+        assert_eq!(a.selection_text().as_deref(), Some("ijk"));
     }
 
     #[test]

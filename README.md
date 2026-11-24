@@ -199,7 +199,6 @@ The current release intentionally keeps a narrow scope:
 
 - X11 only. No Wayland, Windows or macOS.
 - No XIM/IME support yet; dead keys are composed internally for Latin layouts.
-- No automatic reflow of wrapped lines when the window is resized.
 - No ligatures, font feature configuration or image protocols.
 - Selection requests using X11 `INCR` transfers are refused rather than pasted
   partially. Large clipboard transfers may therefore be unavailable.
