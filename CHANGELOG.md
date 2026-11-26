@@ -1,4 +1,10 @@
 
+## [0.1.22](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.21...v0.1.22) - 2026-11-26
+
+### Documentation
+
+- Refresh benchmarks for v0.1.21 with konsole ([#54](https://github.com/pkgforge-apps/reliabilitty/pull/54)) - ([6d3d372](https://github.com/pkgforge-apps/reliabilitty/commit/6d3d3720d98d18e3b3698cc51e2519846afad6b8))
+
 ## [0.1.21](https://github.com/pkgforge-apps/reliabilitty/compare/v0.1.20...v0.1.21) - 2026-11-24
 
 ### Features
